@@ -1,0 +1,111 @@
+#define output_11 5     // Motor 1 control pins
+#define output_12 18
+#define output_13 19
+#define lock1 17        // "lock" control pin for Motor 1
+#define output_21 16   // Motor 2 control pins
+#define output_22 4
+#define output_23 0
+#define lock2 2        // "lock" control pin for Motor 2
+#define output_31 13   // Motor 3 control pins
+#define output_32 12
+#define output_33 14
+#define lock3 11      
+
+// Function prototypes
+void motorControl(int pin1, int pin2, int pin3, int dir, int vel);
+void motorControlTask(void *pvParameters);
+
+void setup() {
+  // Initialize motor pins
+  pinMode(lock1, OUTPUT);
+  pinMode(output_11, OUTPUT);
+  pinMode(output_12, OUTPUT);
+  pinMode(output_13, OUTPUT);
+
+  pinMode(lock2, OUTPUT);
+  pinMode(output_21, OUTPUT);
+  pinMode(output_22, OUTPUT);
+  pinMode(output_23, OUTPUT);
+  
+  pinMode(lock3, OUTPUT);
+  pinMode(output_31, OUTPUT);
+  pinMode(output_32, OUTPUT);
+  pinMode(output_33, OUTPUT);
+
+  // Lock motor pins
+  digitalWrite(lock1, HIGH);
+  digitalWrite(lock2, HIGH);
+  digitalWrite(lock3, HIGH);
+
+  // Create tasks for each motor on separate cores
+  xTaskCreatePinnedToCore(motorControlTask, "Motor1 Task", 2048, (void *)1, 1, NULL, 0); // Core 0
+  xTaskCreatePinnedToCore(motorControlTask, "Motor2 Task", 2048, (void *)2, 1, NULL, 1); // Core 1
+  xTaskCreatePinnedToCore(motorControlTask, "Motor3 Task", 2048, (void *)3, 1, NULL, 0); // Core 0
+}
+
+void loop() {
+  // Main loop doesn't need to do anything since motor control is handled in tasks
+}
+
+// Task function to control each motor
+void motorControlTask(void *pvParameters) {
+  int motorNum = (int)pvParameters;
+
+  switch (motorNum) {
+    case 1: 
+      while (1) {
+        motorControl(output_11, output_12, output_13, 1, 12);  // Motor 1, forward direction (continuous)
+      }
+      break;
+
+    case 2:
+      while (1) {
+        motorControl(output_21, output_22, output_23, 1, 12);  // Motor 2, forward direction (continuous)
+      }
+      break;
+
+    case 3:
+      while (1) {
+        // Timed loop for Motor 3 to switch directions every 50ms
+        motorControl(output_31, output_32, output_33, 1, 50);  // Motor 3, forward direction
+        delay(50);  // Wait for 50ms before changing direction
+        motorControl(output_31, output_32, output_33, 0, 50);  // Motor 3, reverse direction
+        delay(50);  // Wait for 50ms before changing direction again
+      }
+      break;
+  }
+}
+
+// Motor control function to move motor in forward/reverse direction
+void motorControl(int pin1, int pin2, int pin3, int dir, int vel) {
+  int delTime = vel;
+
+  // Forward direction
+  if (dir == 1) {
+    digitalWrite(pin1, LOW);
+    delay(delTime);
+    digitalWrite(pin3, HIGH);
+    delay(delTime);
+    digitalWrite(pin2, LOW);
+    delay(delTime);
+    digitalWrite(pin1, HIGH);
+    delay(delTime);
+    digitalWrite(pin3, LOW);
+    delay(delTime);
+    digitalWrite(pin2, HIGH);
+  }
+  // Reverse direction
+  else if (dir == 0) {
+    digitalWrite(pin1, LOW);
+    delay(delTime);
+    digitalWrite(pin2, HIGH);
+    delay(delTime);
+    digitalWrite(pin3, LOW);
+    delay(delTime);
+    digitalWrite(pin1, HIGH);
+    delay(delTime);
+    digitalWrite(pin2, LOW);
+    delay(delTime);
+    digitalWrite(pin3, HIGH);
+  }
+}
