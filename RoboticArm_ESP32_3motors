@@ -2,14 +2,14 @@
 #define output_12 18
 #define output_13 19
 #define lock1 17        // "lock" control pin for Motor 1
-#define output_21 16   // Motor 2 control pins
-#define output_22 4
-#define output_23 0
+#define output_21 32   // Motor 2 control pins
+#define output_22 34
+#define output_23 35
 #define lock2 2        // "lock" control pin for Motor 2
-#define output_31 13   // Motor 3 control pins
-#define output_32 12
-#define output_33 14
-#define lock3 11      
+#define output_31 16   // Motor 3 control pins
+#define output_32 4
+#define output_33 0
+#define lock3 33      
 
 // Function prototypes
 void motorControl(int pin1, int pin2, int pin3, int dir, int vel);
@@ -65,12 +65,11 @@ void motorControlTask(void *pvParameters) {
       break;
 
     case 3:
+      int direction = 1;  // Start with forward direction for Motor 3
       while (1) {
-        // Timed loop for Motor 3 to switch directions every 50ms
-        motorControl(output_31, output_32, output_33, 1, 50);  // Motor 3, forward direction
-        delay(50);  // Wait for 50ms before changing direction
-        motorControl(output_31, output_32, output_33, 0, 50);  // Motor 3, reverse direction
-        delay(50);  // Wait for 50ms before changing direction again
+        motorControl(output_31, output_32, output_33, direction, 12);  // Move Motor 3 in one direction for 100ms
+        delay(100);  // Keep motor moving in the current direction for 100ms
+        direction = !direction;  // Switch direction for the next cycle (toggle between 1 and 0)
       }
       break;
   }
