@@ -1,0 +1,152 @@
+// Motor 1
+#define output_11 5
+#define output_12 18
+#define output_13 19
+#define lock1 17
+
+// Motor 2
+#define output_21 16
+#define output_22 4
+#define output_23 0
+#define lock2 2
+
+// Motor 3
+#define output_31 32
+#define output_32 34
+#define output_33 35
+#define lock3 33
+
+// Motor 4
+#define output_41 25
+#define output_42 26
+#define output_43 27
+#define lock4 14
+
+// Motor 5
+#define output_51 22
+#define output_52 23
+#define output_53 21
+#define lock5 15
+
+int motorDir[5] = {1, 1, 1, 1, 1};    // Default direction: 1 = CW
+bool motorActive[5] = {true, true, true, true, true};  // Active state
+int motorSpeed = 12;                  // Default velocity
+
+// Function prototypes
+void motorControl(int pin1, int pin2, int pin3, int dir, int vel, bool active);
+void motorTask(void *pvParameters);
+void parseSerialCommand();
+
+void setup() {
+  Serial.begin(115200);
+
+  int pins[5][4] = {
+    {lock1, output_11, output_12, output_13},
+    {lock2, output_21, output_22, output_23},
+    {lock3, output_31, output_32, output_33},
+    {lock4, output_41, output_42, output_43},
+    {lock5, output_51, output_52, output_53}
+  };
+
+  for (int i = 0; i < 5; i++) {
+    pinMode(pins[i][0], OUTPUT);
+    pinMode(pins[i][1], OUTPUT);
+    pinMode(pins[i][2], OUTPUT);
+    pinMode(pins[i][3], OUTPUT);
+    digitalWrite(pins[i][0], HIGH);
+  }
+
+  // Tasks: Motor 1,3,5 on Core 0; Motor 2,4 on Core 1
+  xTaskCreatePinnedToCore(motorTask, "Motor1", 2048, (void *)1, 1, NULL, 0);
+  xTaskCreatePinnedToCore(motorTask, "Motor2", 2048, (void *)2, 1, NULL, 1);
+  xTaskCreatePinnedToCore(motorTask, "Motor3", 2048, (void *)3, 1, NULL, 0);
+  xTaskCreatePinnedToCore(motorTask, "Motor4", 2048, (void *)4, 1, NULL, 1);
+  xTaskCreatePinnedToCore(motorTask, "Motor5", 2048, (void *)5, 1, NULL, 0);
+}
+
+void loop() {
+  parseSerialCommand();  // Check for serial input
+}
+
+void parseSerialCommand() {
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+
+    if (command.startsWith("M") && command.length() == 3) {
+      int motorId = command.charAt(1) - '0';
+      int direction = command.charAt(2) - '0';
+      if (motorId >= 1 && motorId <= 5 && (direction == 0 || direction == 1)) {
+        motorDir[motorId - 1] = direction;
+        Serial.printf("Motor %d direction set to %s\n", motorId, direction ? "CW" : "CCW");
+      } else {
+        Serial.println("Invalid motor command.");
+      }
+
+    } else if (command.startsWith("V")) {
+      int newSpeed = command.substring(1).toInt();
+      if (newSpeed >= 1 && newSpeed <= 100) {
+        motorSpeed = newSpeed;
+        Serial.printf("Velocity set to %d ms delay per step\n", motorSpeed);
+      } else {
+        Serial.println("Invalid velocity. Use V1 to V100.");
+      }
+
+    } else if (command.equalsIgnoreCase("S")) {
+      for (int i = 0; i < 5; i++) motorActive[i] = false;
+      Serial.println("All motors stopped.");
+
+    } else if (command.equalsIgnoreCase("M")) {
+      for (int i = 0; i < 5; i++) motorActive[i] = true;
+      Serial.println("All motors resumed.");
+
+    } else {
+      Serial.println("Unknown command.");
+    }
+  }
+}
+
+// Motor task for each joint
+void motorTask(void *pvParameters) {
+  int motorNum = (int)pvParameters;
+  int pin1, pin2, pin3;
+
+  switch (motorNum) {
+    case 1: pin1 = output_11; pin2 = output_12; pin3 = output_13; break;
+    case 2: pin1 = output_21; pin2 = output_22; pin3 = output_23; break;
+    case 3: pin1 = output_31; pin2 = output_32; pin3 = output_33; break;
+    case 4: pin1 = output_41; pin2 = output_42; pin3 = output_43; break;
+    case 5: pin1 = output_51; pin2 = output_52; pin3 = output_53; break;
+  }
+
+  while (true) {
+    int dir = motorDir[motorNum - 1];
+    bool active = motorActive[motorNum - 1];
+    motorControl(pin1, pin2, pin3, dir, motorSpeed, active);
+  }
+}
+
+// Core motor stepping logic
+void motorControl(int pin1, int pin2, int pin3, int dir, int vel, bool active) {
+  if (!active) {
+    delay(vel); // idle delay
+    return;
+  }
+
+  int d = vel;
+  if (dir == 1) {
+    digitalWrite(pin1, LOW); delay(d);
+    digitalWrite(pin3, HIGH); delay(d);
+    digitalWrite(pin2, LOW); delay(d);
+    digitalWrite(pin1, HIGH); delay(d);
+    digitalWrite(pin3, LOW); delay(d);
+    digitalWrite(pin2, HIGH); delay(d);
+  } else {
+    digitalWrite(pin1, LOW); delay(d);
+    digitalWrite(pin2, HIGH); delay(d);
+    digitalWrite(pin3, LOW); delay(d);
+    digitalWrite(pin1, HIGH); delay(d);
+    digitalWrite(pin2, LOW); delay(d);
+    digitalWrite(pin3, HIGH); delay(d);
+  }
+}
