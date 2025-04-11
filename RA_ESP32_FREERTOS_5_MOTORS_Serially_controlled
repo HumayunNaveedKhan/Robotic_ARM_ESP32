@@ -12,8 +12,8 @@
 
 // Motor 3
 #define output_31 32
-#define output_32 34
-#define output_33 35
+#define output_32 12
+#define output_33 13
 #define lock3 33
 
 // Motor 4
@@ -23,10 +23,10 @@
 #define lock4 14
 
 // Motor 5
-#define output_51 22
+#define output_51 15
 #define output_52 23
 #define output_53 21
-#define lock5 15
+#define lock5 22 // scl sda to be free from use.
 
 int motorDir[5] = {1, 1, 1, 1, 1};             // Default direction
 bool motorActive[5] = {true, true, true, true, true}; // Start as active
