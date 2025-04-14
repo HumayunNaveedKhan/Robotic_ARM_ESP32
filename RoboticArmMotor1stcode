@@ -1,0 +1,49 @@
+#define output_1 23     // Adjust these GPIOs based on your wiring
+#define output_2 2
+#define output_3 15
+#define lock 22       // "lock" output control pin
+
+void setup() {
+  pinMode(lock, OUTPUT);
+  pinMode(output_1, OUTPUT);
+  pinMode(output_2, OUTPUT);
+  pinMode(output_3, OUTPUT);
+}
+
+void loop() {
+  motorControl(output_1, output_2, output_3, 1, 12); // direction: 1, delay: 12ms
+}
+
+void motorControl(int pin1, int pin2, int pin3, int dir, int vel) {
+  digitalWrite(lock, HIGH);
+  int delTime = vel;
+
+  if (dir == 0) {
+    delay(delTime);
+    digitalWrite(pin1, LOW);
+    delay(delTime);
+    digitalWrite(pin2, HIGH);
+    delay(delTime);
+    digitalWrite(pin3, LOW);
+    delay(delTime);
+    digitalWrite(pin1, HIGH);
+    delay(delTime);
+    digitalWrite(pin2, LOW);
+    delay(delTime);
+    digitalWrite(pin3, HIGH);
+
+  } else if (dir == 1) {
+    delay(delTime);
+    digitalWrite(pin1, LOW);
+    delay(delTime);
+    digitalWrite(pin3, HIGH);
+    delay(delTime);
+    digitalWrite(pin2, LOW);
+    delay(delTime);
+    digitalWrite(pin1, HIGH);
+    delay(delTime);
+    digitalWrite(pin3, LOW);
+    delay(delTime);
+    digitalWrite(pin2, HIGH);
+  }
+}
