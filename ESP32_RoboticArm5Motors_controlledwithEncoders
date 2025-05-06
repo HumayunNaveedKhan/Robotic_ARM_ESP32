@@ -1,0 +1,123 @@
+#include <Arduino.h>
+
+// Motor GPIO Definitions
+#define M1_A 5
+#define M1_B 18
+#define M1_C 19
+
+#define M2_A 16
+#define M2_B 4
+#define M2_C 0
+
+#define M3_A 32
+#define M3_B 12
+#define M3_C 13
+
+#define M4_A 25
+#define M4_B 26
+#define M4_C 27
+
+#define M5_A 15
+#define M5_B 23
+#define M5_C 21
+
+// Motor structure
+struct Motor {
+  const char* name;
+  int pin1, pin2, pin3;
+  volatile int dir;        // 0 = CCW, 1 = CW
+  volatile int vel;        // delay in ms
+  volatile bool run;       // true = active
+};
+
+// Motor configurations
+Motor motors[5] = {
+  {"M1", M1_A, M1_B, M1_C, 1, 12, false},
+  {"M2", M2_A, M2_B, M2_C, 1, 12, false},
+  {"M3", M3_A, M3_B, M3_C, 1, 12, false},
+  {"M4", M4_A, M4_B, M4_C, 1, 12, false},
+  {"M5", M5_A, M5_B, M5_C, 1, 12, false}
+};
+
+// Step motor based on direction
+void stepMotor(Motor* m) {
+  int d = m->vel;
+
+  if (m->dir == 0) {  // CCW
+    digitalWrite(m->pin1, LOW); delay(d);
+    digitalWrite(m->pin2, HIGH); delay(d);
+    digitalWrite(m->pin3, LOW); delay(d);
+    digitalWrite(m->pin1, HIGH); delay(d);
+    digitalWrite(m->pin2, LOW); delay(d);
+    digitalWrite(m->pin3, HIGH); delay(d);
+  } else {            // CW
+    digitalWrite(m->pin1, LOW); delay(d);
+    digitalWrite(m->pin3, HIGH); delay(d);
+    digitalWrite(m->pin2, LOW); delay(d);
+    digitalWrite(m->pin1, HIGH); delay(d);
+    digitalWrite(m->pin3, LOW); delay(d);
+    digitalWrite(m->pin2, HIGH); delay(d);
+  }
+}
+
+// Motor control task
+void motorTask(void* param) {
+  Motor* m = (Motor*)param;
+  while (1) {
+    if (m->run) {
+      stepMotor(m);
+    } else {
+      delay(50);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Setup GPIOs
+  for (int i = 0; i < 5; i++) {
+    pinMode(motors[i].pin1, OUTPUT);
+    pinMode(motors[i].pin2, OUTPUT);
+    pinMode(motors[i].pin3, OUTPUT);
+  }
+
+  // Launch motor tasks on different cores
+  for (int i = 0; i < 5; i++) {
+    int core = (i < 3) ? 0 : 1;  // Core 0: M1-M3, Core 1: M4-M5
+    xTaskCreatePinnedToCore(motorTask, motors[i].name, 2048, &motors[i], 1, NULL, core);
+  }
+
+  Serial.println("READY. Commands: M10/M11/M1OFF, ALLON/ALLOFF, M1SPD=20 etc.");
+}
+
+void loop() {
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+
+    if (cmd == "ALLON") {
+      for (int i = 0; i < 5; i++) motors[i].run = true;
+    } else if (cmd == "ALLOFF") {
+      for (int i = 0; i < 5; i++) motors[i].run = false;
+    } else {
+      for (int i = 0; i < 5; i++) {
+        String prefix = "M" + String(i + 1);
+        if (cmd == prefix + "0") {
+          motors[i].dir = 1; motors[i].run = true;
+        } else if (cmd == prefix + "1") {
+          motors[i].dir = 0; motors[i].run = true;
+        } else if (cmd == prefix + "OFF") {
+          motors[i].run = false;
+        } else if (cmd.startsWith(prefix + "SPD=")) {
+          int spd = cmd.substring((prefix + "SPD=").length()).toInt();
+          motors[i].vel = constrain(spd, 1, 100);  // limit to safe range
+        }
+      }
+    }
+
+    Serial.println("OK: " + cmd);
+  }
+
+  delay(20);
+}
