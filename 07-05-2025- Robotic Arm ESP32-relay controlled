@@ -1,0 +1,174 @@
+#include <Arduino.h>
+
+// ========== ACTIVE STATE DEFINITIONS ==========
+#define RELAY_ACTIVE LOW     // Relay ON when pin is LOW
+#define RELAY_INACTIVE HIGH  // Relay OFF when pin is HIGH
+
+// ========== RELAY CONTROL PINS ==========
+#define R1 0   // Relay for M1
+#define R2 4   // Relay for M2
+#define R3 16  // Relay for M3
+#define R4 17  // Relay for M4
+#define R5 32  // Relay for M5
+
+// ========== MOTOR SOURCE PINS ==========
+#define M1_A 19
+#define M1_B 18
+#define M1_C 5
+
+// ========== MUTEX FOR SHARED CONTROL ==========
+SemaphoreHandle_t motorMutex;
+
+// ========== MOTOR STRUCTURE ==========
+struct Motor {
+  const char* name;
+  int relayPin;
+  int dir;             // 0=CCW, 1=CW
+  int speedMs;         // Delay per step in ms
+  bool run;            // Running state
+  TaskHandle_t handle; // RTOS Task handle
+};
+
+// ========== MOTOR CONFIG ==========
+Motor motors[5] = {
+  { "M1", R1, 1, 12, false, NULL },
+  { "M2", R2, 1, 12, false, NULL },
+  { "M3", R3, 1, 12, false, NULL },
+  { "M4", R4, 1, 12, false, NULL },
+  { "M5", R5, 1, 12, false, NULL }
+};
+
+// ========== STEP MOTOR SEQUENCE ==========
+void stepMotor(int dir, int delayMs) {
+  if (dir == 0) {
+    digitalWrite(M1_A, LOW); delay(delayMs);
+    digitalWrite(M1_B, HIGH); delay(delayMs);
+    digitalWrite(M1_C, LOW); delay(delayMs);
+    digitalWrite(M1_A, HIGH); delay(delayMs);
+    digitalWrite(M1_B, LOW); delay(delayMs);
+    digitalWrite(M1_C, HIGH); delay(delayMs);
+  } else {
+    digitalWrite(M1_A, LOW); delay(delayMs);
+    digitalWrite(M1_C, HIGH); delay(delayMs);
+    digitalWrite(M1_B, LOW); delay(delayMs);
+    digitalWrite(M1_A, HIGH); delay(delayMs);
+    digitalWrite(M1_C, LOW); delay(delayMs);
+    digitalWrite(M1_B, HIGH); delay(delayMs);
+  }
+}
+
+// ========== RELAY CONTROL ==========
+void setRelay(int pin, bool state) {
+  digitalWrite(pin, state ? RELAY_ACTIVE : RELAY_INACTIVE);
+}
+
+// ========== DISABLE ALL ==========
+void disableAllMotors() {
+  for (int i = 0; i < 5; i++) {
+    setRelay(motors[i].relayPin, false);
+  }
+}
+
+// ========== MOTOR TASK ==========
+void motorTask(void* param) {
+  Motor* m = (Motor*)param;
+
+  while (1) {
+    xSemaphoreTake(motorMutex, portMAX_DELAY);
+    bool shouldRun = m->run;
+    int dir = m->dir;
+    int spd = m->speedMs;
+    xSemaphoreGive(motorMutex);
+
+    if (shouldRun) {
+      setRelay(m->relayPin, true);  // Turn relay ON
+      stepMotor(dir, spd);          // Use shared motor drivers
+    } else {
+      setRelay(m->relayPin, false); // Turn relay OFF
+      delay(50);
+    }
+  }
+}
+
+// ========== SERIAL COMMAND PROCESSING ==========
+void processCommand(String cmd) {
+  cmd.trim();
+  cmd.toUpperCase();
+
+  xSemaphoreTake(motorMutex, portMAX_DELAY);
+
+  if (cmd == "ALLON") {
+    for (int i = 0; i < 5; i++) motors[i].run = true;
+  } else if (cmd == "ALLOFF") {
+    for (int i = 0; i < 5; i++) motors[i].run = false;
+  } else {
+    for (int i = 0; i < 5; i++) {
+      String prefix = "M" + String(i + 1);
+
+      if (cmd == prefix + "0") {
+        motors[i].dir = 1; motors[i].run = true;
+      } else if (cmd == prefix + "1") {
+        motors[i].dir = 0; motors[i].run = true;
+      } else if (cmd == prefix + "OFF") {
+        motors[i].run = false;
+      } else if (cmd.startsWith(prefix + "S")) {
+        int spd = cmd.substring((prefix + "S").length()).toInt();
+        motors[i].speedMs = constrain(spd, 1, 100);
+      }
+    }
+  }
+
+  xSemaphoreGive(motorMutex);
+  Serial.println("OK: " + cmd);
+}
+
+// ========== SERIAL TASK ==========
+void serialTask(void* param) {
+  while (1) {
+    if (Serial.available()) {
+      String cmd = Serial.readStringUntil('\n');
+      processCommand(cmd);
+    }
+    delay(10);
+  }
+}
+
+// ========== SETUP ==========
+void setup() {
+  Serial.begin(115200);
+
+  // Motor driver shared pins
+  pinMode(M1_A, OUTPUT);
+  pinMode(M1_B, OUTPUT);
+  pinMode(M1_C, OUTPUT);
+  digitalWrite(M1_A, LOW);
+  digitalWrite(M1_B, LOW);
+  digitalWrite(M1_C, LOW);
+
+  // Relay pins
+  for (int i = 0; i < 5; i++) {
+    pinMode(motors[i].relayPin, OUTPUT);
+    digitalWrite(motors[i].relayPin, RELAY_INACTIVE); // OFF initially
+  }
+
+  motorMutex = xSemaphoreCreateMutex();
+
+  // Launch motor tasks on cores (distribute load)
+  for (int i = 0; i < 5; i++) {
+    int core = (i % 2 == 0) ? 0 : 1;
+    xTaskCreatePinnedToCore(motorTask, motors[i].name, 2048, &motors[i], 1, &motors[i].handle, core);
+  }
+
+  // Serial command processor
+  xTaskCreatePinnedToCore(serialTask, "SerialTask", 2048, NULL, 2, NULL, 1);
+
+  Serial.println("READY. Commands:");
+  Serial.println("M10/M11/M1OFF - Motor 1 CW/CCW/OFF");
+  Serial.println("M1S20 - Set speed (ms delay) for M1");
+  Serial.println("ALLON / ALLOFF - Start/Stop all motors");
+}
+
+// ========== LOOP ==========
+void loop() {
+  delay(1000); // Nothing here, RTOS tasks handle everything
+}
