@@ -1,0 +1,114 @@
+#include "Arduino.h"
+
+// IR2130 Gate Driver pins
+#define HIN1 19  // High-side pin for phase A
+#define HIN2 5   // High-side pin for phase B
+#define HIN3 16  // High-side pin for phase C
+
+#define LIN1 18  // Low-side pin for phase A
+#define LIN2 17  // Low-side pin for phase B
+#define LIN3 4   // Low-side pin for phase C
+
+#define lock 22  // Lock output control pin
+
+void setup() {
+  // Configure pins as outputs
+  pinMode(lock, OUTPUT);
+  
+  // High-side pins
+  pinMode(HIN1, OUTPUT);
+  pinMode(HIN2, OUTPUT);
+  pinMode(HIN3, OUTPUT);
+  
+  // Low-side pins
+  pinMode(LIN1, OUTPUT);
+  pinMode(LIN2, OUTPUT);
+  pinMode(LIN3, OUTPUT);
+  
+  // Initialize all pins to LOW
+  digitalWrite(HIN1, LOW);
+  digitalWrite(HIN2, LOW);
+  digitalWrite(HIN3, LOW);
+  digitalWrite(LIN1, LOW);
+  digitalWrite(LIN2, LOW);
+  digitalWrite(LIN3, LOW);
+  digitalWrite(lock, LOW);
+}
+
+void loop() {
+  // Control the motor: direction 1, delay 12ms
+  motorControl(1, 12);
+}
+
+// Motor control function for all 6 pins
+void motorControl(int dir, int vel) {
+  digitalWrite(lock, HIGH);
+  int delTime = vel;
+  
+  if (dir == 0) {
+    // Clockwise direction
+    
+    // Step 1
+    delay(delTime);
+    digitalWrite(HIN1, LOW);
+    digitalWrite(LIN1, HIGH);  // Complementary drive
+    
+    // Step 2
+    delay(delTime);
+    digitalWrite(HIN2, HIGH);
+    digitalWrite(LIN2, LOW);   // Complementary drive
+    
+    // Step 3
+    delay(delTime);
+    digitalWrite(HIN3, LOW);
+    digitalWrite(LIN3, HIGH);  // Complementary drive
+    
+    // Step 4
+    delay(delTime);
+    digitalWrite(HIN1, HIGH);
+    digitalWrite(LIN1, LOW);   // Complementary drive
+    
+    // Step 5
+    delay(delTime);
+    digitalWrite(HIN2, LOW);
+    digitalWrite(LIN2, HIGH);  // Complementary drive
+    
+    // Step 6
+    delay(delTime);
+    digitalWrite(HIN3, HIGH);
+    digitalWrite(LIN3, LOW);   // Complementary drive
+    
+  } else if (dir == 1) {
+    // Counter-clockwise direction
+    
+    // Step 1
+    delay(delTime);
+    digitalWrite(HIN1, LOW);
+    digitalWrite(LIN1, HIGH);  // Complementary drive
+    
+    // Step 2
+    delay(delTime);
+    digitalWrite(HIN3, HIGH);
+    digitalWrite(LIN3, LOW);   // Complementary drive
+    
+    // Step 3
+    delay(delTime);
+    digitalWrite(HIN2, LOW);
+    digitalWrite(LIN2, HIGH);  // Complementary drive
+    
+    // Step 4
+    delay(delTime);
+    digitalWrite(HIN1, HIGH);
+    digitalWrite(LIN1, LOW);   // Complementary drive
+    
+    // Step 5
+    delay(delTime);
+    digitalWrite(HIN3, LOW);
+    digitalWrite(LIN3, HIGH);  // Complementary drive
+    
+    // Step 6
+    delay(delTime);
+    digitalWrite(HIN2, HIGH);
+    digitalWrite(LIN2, LOW);   // Complementary drive
+  }
+}
