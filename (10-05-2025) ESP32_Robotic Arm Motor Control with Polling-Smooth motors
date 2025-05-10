@@ -1,0 +1,384 @@
+#include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+
+// IR2130 Gate Driver pins
+#define HIN1 19
+#define HIN2 18
+#define HIN3 5
+#define LIN1 17
+#define LIN2 16
+#define LIN3 4
+
+// Relay pins for motor control (Active LOW)
+#define RELAY1 26
+#define RELAY2 27
+#define RELAY3 14
+#define RELAY4 12
+#define RELAY5 13
+
+// Encoder pins
+#define ENC1_A 25
+#define ENC1_B 33
+#define ENC2_A 32
+#define ENC2_B 35
+#define ENC3_A 34
+#define ENC3_B 39
+#define ENC4_A 36
+#define ENC4_B 23
+#define ENC5_A 22
+#define ENC5_B 21
+
+// Arrays for easy access to pins
+const int RELAY_PINS[5] = {RELAY1, RELAY2, RELAY3, RELAY4, RELAY5};
+const int ENCA_PINS[5] = {ENC1_A, ENC2_A, ENC3_A, ENC4_A, ENC5_A};
+const int ENCB_PINS[5] = {ENC1_B, ENC2_B, ENC3_B, ENC4_B, ENC5_B};
+
+// Motor state variables
+volatile int activeMotor = -1;          // Which motor is currently active (-1 = none)
+volatile bool motorRunning = false;     // Is the motor currently running
+volatile int motorDirection = 0;        // 0 = CW, 1 = CCW
+volatile long encoderPulses = 0;        // Encoder count for the active motor
+
+// Command structure
+typedef struct {
+  int motorNum;    // 1-5 for specific motor, 0 for none
+  bool turnOn;     // true = ON, false = OFF
+  int direction;   // 0 = CW, 1 = CCW, -1 = no change
+} MotorCommand_t;
+
+// FreeRTOS handles
+TaskHandle_t motorTaskHandle = NULL;
+TaskHandle_t encoderTaskHandle = NULL;
+QueueHandle_t commandQueue;
+
+String inputString = "";
+bool stringComplete = false;
+
+// Function prototypes
+void motorControlTask(void* pvParameters);
+void encoderTask(void* pvParameters);
+void statusReportTask(void* pvParameters);
+void motorControl(int dir, int vel);
+
+void setup() {
+  Serial.begin(115200);
+  inputString.reserve(20);
+
+  // Create command queue
+  commandQueue = xQueueCreate(5, sizeof(MotorCommand_t));
+
+  // Configure driver pins
+  pinMode(HIN1, OUTPUT); pinMode(HIN2, OUTPUT); pinMode(HIN3, OUTPUT);
+  pinMode(LIN1, OUTPUT); pinMode(LIN2, OUTPUT); pinMode(LIN3, OUTPUT);
+
+  // Initialize all pins to LOW
+  digitalWrite(HIN1, LOW); digitalWrite(HIN2, LOW); digitalWrite(HIN3, LOW);
+  digitalWrite(LIN1, LOW); digitalWrite(LIN2, LOW); digitalWrite(LIN3, LOW);
+
+  // Configure relay pins (active LOW)
+  for (int i = 0; i < 5; i++) {
+    pinMode(RELAY_PINS[i], OUTPUT);
+    digitalWrite(RELAY_PINS[i], HIGH); // Relays off initially
+  }
+
+  // Configure all encoder pins with pull-up resistors
+  for (int i = 0; i < 5; i++) {
+    pinMode(ENCA_PINS[i], INPUT_PULLUP);
+    pinMode(ENCB_PINS[i], INPUT_PULLUP);
+  }
+
+  // Create motor control task on core 1
+  xTaskCreatePinnedToCore(
+    motorControlTask,
+    "MotorTask",
+    4096,
+    NULL,
+    1,
+    &motorTaskHandle,
+    1    // Run on core 1
+  );
+
+  // Create encoder task on core 0
+  xTaskCreatePinnedToCore(
+    encoderTask,
+    "EncoderTask",
+    2048,
+    NULL,
+    2,    // Higher priority
+    &encoderTaskHandle,
+    0     // Run on core 0
+  );
+
+  // Create status reporting task on core 0
+  xTaskCreatePinnedToCore(
+    statusReportTask,
+    "StatusTask",
+    2048,
+    NULL,
+    1,
+    NULL,
+    0    // Run on core 0
+  );
+
+  Serial.println("Single Motor Control System Ready");
+}
+
+void loop() {
+  // Read serial commands
+  while (Serial.available()) {
+    char inChar = (char)Serial.read();
+    if (inChar != '\n' && inChar != '\r') {
+      inputString += inChar;
+    }
+    if (inChar == '\n') {
+      stringComplete = true;
+    }
+  }
+
+  if (stringComplete) {
+    processCommand(inputString);
+    inputString = "";
+    stringComplete = false;
+  }
+  
+  // Keep the loop light
+  delay(10);
+}
+
+// Process incoming serial commands
+void processCommand(String command) {
+  command.trim();
+  command.toUpperCase();
+  Serial.print("Command received: ");
+  Serial.println(command);
+
+  MotorCommand_t cmd;
+  cmd.turnOn = false;
+  cmd.direction = -1;  // No change by default
+  cmd.motorNum = 0;    // No motor by default
+
+  // Check for individual motor commands
+  for (int i = 1; i <= 5; i++) {
+    String motorNum = String(i);
+    
+    if (command == "M" + motorNum + "ON") {
+      cmd.motorNum = i;
+      cmd.turnOn = true;
+      xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+      Serial.println("Motor " + motorNum + " turning ON");
+      return;
+    }
+    if (command == "M" + motorNum + "OFF") {
+      cmd.motorNum = i;
+      cmd.turnOn = false;
+      xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+      Serial.println("Motor " + motorNum + " turning OFF");
+      return;
+    }
+    if (command == "M" + motorNum + "0" || command == "M" + motorNum + "CW") {
+      cmd.motorNum = i;
+      cmd.direction = 0;
+      xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+      Serial.println("Motor " + motorNum + " set to Clockwise");
+      return;
+    }
+    if (command == "M" + motorNum + "1" || command == "M" + motorNum + "CCW") {
+      cmd.motorNum = i;
+      cmd.direction = 1;
+      xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+      Serial.println("Motor " + motorNum + " set to Counter-Clockwise");
+      return;
+    }
+  }
+
+  // Handle "all motors" commands (turn off active motor)
+  if (command == "ALLOFF") {
+    cmd.motorNum = 0;  // Special code to turn off whatever is active
+    cmd.turnOn = false;
+    xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+    Serial.println("Turning OFF active motor");
+    return;
+  }
+
+  Serial.println("Unknown command");
+}
+
+// Task to handle motor control
+void motorControlTask(void* pvParameters) {
+  MotorCommand_t cmd;
+  const int motorSpeed = 5; // Velocity parameter for motorControl function
+  
+  while (1) {
+    // Check for new commands
+    if (xQueueReceive(commandQueue, &cmd, 0) == pdTRUE) {
+      // Process the command
+      if (cmd.motorNum == 0) {
+        // Turn off any active motor
+        if (activeMotor >= 0) {
+          digitalWrite(RELAY_PINS[activeMotor], HIGH);  // Turn off relay
+          activeMotor = -1;
+          motorRunning = false;
+        }
+      } else {
+        // Handle specific motor command
+        int motorIndex = cmd.motorNum - 1;  // Convert to 0-based index
+        
+        // Turn off current motor if different
+        if (activeMotor >= 0 && activeMotor != motorIndex) {
+          digitalWrite(RELAY_PINS[activeMotor], HIGH);  // Turn off previous motor
+        }
+        
+        // Update motor state
+        activeMotor = motorIndex;
+        
+        // Update direction if specified
+        if (cmd.direction >= 0) {
+          motorDirection = cmd.direction;
+        }
+        
+        // Update motor running state
+        motorRunning = cmd.turnOn;
+        
+        // Apply relay state
+        digitalWrite(RELAY_PINS[motorIndex], motorRunning ? LOW : HIGH);
+        
+        // Reset encoder count when changing motors
+        encoderPulses = 0;
+      }
+    }
+    
+    // Drive the active motor if it's running
+    if (motorRunning && activeMotor >= 0) {
+      // Call the original motorControl function to drive the motor
+      motorControl(motorDirection, motorSpeed);
+    } else {
+      // Motor not running, just a small delay to prevent CPU hogging
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+  }
+}
+
+// Original motor control function with non-blocking implementation
+void motorControl(int dir, int vel) {
+  // Store the original delay value
+  int delTime = vel;
+  
+  // Use a static variable to track the current step in the sequence
+  static int step = 0;
+  
+  // Execute a single step of the sequence based on current position
+  if (dir == 0) {
+    // Clockwise sequence
+    switch (step) {
+      case 0:
+        digitalWrite(HIN1, LOW); digitalWrite(LIN1, HIGH);
+        break;
+      case 1:
+        digitalWrite(HIN2, HIGH); digitalWrite(LIN2, LOW);
+        break;
+      case 2:
+        digitalWrite(HIN3, LOW); digitalWrite(LIN3, HIGH);
+        break;
+      case 3:
+        digitalWrite(HIN1, HIGH); digitalWrite(LIN1, LOW);
+        break;
+      case 4:
+        digitalWrite(HIN2, LOW); digitalWrite(LIN2, HIGH);
+        break;
+      case 5:
+        digitalWrite(HIN3, HIGH); digitalWrite(LIN3, LOW);
+        break;
+    }
+  } else {
+    // Counter-clockwise sequence
+    switch (step) {
+      case 0:
+        digitalWrite(HIN1, LOW); digitalWrite(LIN1, HIGH);
+        break;
+      case 1:
+        digitalWrite(HIN3, HIGH); digitalWrite(LIN3, LOW);
+        break;
+      case 2:
+        digitalWrite(HIN2, LOW); digitalWrite(LIN2, HIGH);
+        break;
+      case 3:
+        digitalWrite(HIN1, HIGH); digitalWrite(LIN1, LOW);
+        break;
+      case 4:
+        digitalWrite(HIN3, LOW); digitalWrite(LIN3, HIGH);
+        break;
+      case 5:
+        digitalWrite(HIN2, HIGH); digitalWrite(LIN2, LOW);
+        break;
+    }
+  }
+  
+  // Move to next step
+  step = (step + 1) % 6;
+  
+  // Non-blocking delay - use vTaskDelay instead of delay()
+  vTaskDelay(pdMS_TO_TICKS(delTime));
+}
+
+// Task to monitor the active encoder
+void encoderTask(void* pvParameters) {
+  int lastA = 0;
+  int lastB = 0;
+  
+  while (1) {
+    if (motorRunning && activeMotor >= 0) {
+      // Get the current active encoder pins
+      int encA = ENCA_PINS[activeMotor];
+      int encB = ENCB_PINS[activeMotor];
+      
+      // Read current encoder state
+      int currentA = digitalRead(encA);
+      int currentB = digitalRead(encB);
+      
+      // Check for state change (edge detection)
+      if (currentA != lastA || currentB != lastB) {
+        // Update encoder count based on rotation direction
+        if ((lastA == 0 && currentA == 1 && currentB == 0) || 
+            (lastB == 1 && currentB == 0 && currentA == 1)) {
+          encoderPulses++;
+        } else {
+          encoderPulses--;
+        }
+        
+        // Update states
+        lastA = currentA;
+        lastB = currentB;
+      }
+      
+      // Short delay to prevent CPU hogging while still being responsive
+      vTaskDelay(1);
+    } else {
+      // No active motor, reset encoder states and sleep longer
+      lastA = 0;
+      lastB = 0;
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
+  }
+}
+
+// Task to periodically report status
+void statusReportTask(void* pvParameters) {
+  while (1) {
+    if (motorRunning && activeMotor >= 0) {
+      // Calculate angle from encoder pulses
+      float degrees = (encoderPulses * 360.0) / (1024.0 * 4);
+      
+      // Report status every 500ms
+      Serial.printf("Motor %d: %ld pulses, %.2f degrees, Dir: %s\n", 
+                   activeMotor + 1, 
+                   encoderPulses, 
+                   degrees,
+                   motorDirection == 0 ? "CW" : "CCW");
+    }
+    
+    // Status update interval
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
