@@ -1,0 +1,189 @@
+#include <Arduino.h>
+
+// IR2130 Gate Driver pins
+#define HIN1 19
+#define HIN2 18
+#define HIN3 5
+#define LIN1 17
+#define LIN2 16
+#define LIN3 4
+
+// Relay pins (Active LOW)
+#define RELAY1 26
+#define RELAY2 27
+#define RELAY3 14
+#define RELAY4 12
+#define RELAY5 13
+
+// Encoder pins per motor (A and B phases)
+int encA[5] = {25, 32, 34, 36, 22};
+int encB[5] = {33, 35, 39, 23, 21};
+
+volatile long encoderCount[5] = {0, 0, 0, 0, 0};
+int lastA[5] = {0};
+int lastB[5] = {0};
+
+float pulsesPerDegree[5] = {512.0, 512.0, 512.0, 512.0, 512.0};
+
+bool motorOn[5] = {false, false, false, false, false};
+int motorDir[5] = {0, 0, 0, 0, 0};
+
+String inputString = "";
+bool stringComplete = false;
+
+void setup() {
+  Serial.begin(115200);
+  inputString.reserve(20);
+
+  // Setup motor pins
+  pinMode(HIN1, OUTPUT); pinMode(HIN2, OUTPUT); pinMode(HIN3, OUTPUT);
+  pinMode(LIN1, OUTPUT); pinMode(LIN2, OUTPUT); pinMode(LIN3, OUTPUT);
+
+  pinMode(RELAY1, OUTPUT); pinMode(RELAY2, OUTPUT); pinMode(RELAY3, OUTPUT);
+  pinMode(RELAY4, OUTPUT); pinMode(RELAY5, OUTPUT);
+
+  digitalWrite(HIN1, LOW); digitalWrite(HIN2, LOW); digitalWrite(HIN3, LOW);
+  digitalWrite(LIN1, LOW); digitalWrite(LIN2, LOW); digitalWrite(LIN3, LOW);
+
+  digitalWrite(RELAY1, HIGH); digitalWrite(RELAY2, HIGH); digitalWrite(RELAY3, HIGH);
+  digitalWrite(RELAY4, HIGH); digitalWrite(RELAY5, HIGH);
+
+  for (int i = 0; i < 5; i++) {
+    pinMode(encA[i], INPUT);
+    pinMode(encB[i], INPUT);
+    lastA[i] = digitalRead(encA[i]);
+    lastB[i] = digitalRead(encB[i]);
+
+    int *arg = new int(i);
+    xTaskCreatePinnedToCore(encoderPollingTask, "EncPoll", 2048, arg, 1, NULL, 0);
+  }
+
+  Serial.println("Motor Control Ready with Encoder Feedback");
+}
+
+void loop() {
+  if (stringComplete) {
+    processCommand(inputString);
+    inputString = "";
+    stringComplete = false;
+  }
+
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(getRelayPin(i), motorOn[i] ? LOW : HIGH);
+    if (motorOn[i]) {
+      motorControl(motorDir[i], 12);
+    }
+  }
+}
+
+int getRelayPin(int motorIndex) {
+  switch (motorIndex) {
+    case 0: return RELAY1;
+    case 1: return RELAY2;
+    case 2: return RELAY3;
+    case 3: return RELAY4;
+    case 4: return RELAY5;
+    default: return -1;
+  }
+}
+
+void processCommand(String command) {
+  command.trim();
+  command.toUpperCase();
+
+  Serial.print("Command received: ");
+  Serial.println(command);
+
+  for (int i = 1; i <= 5; i++) {
+    String motorNum = String(i);
+    if (command == "M" + motorNum + "ON") {
+      motorOn[i - 1] = true;
+      encoderCount[i - 1] = 0;
+      Serial.println("Motor " + motorNum + " turned ON");
+      return;
+    }
+    if (command == "M" + motorNum + "OFF") {
+      motorOn[i - 1] = false;
+      Serial.println("Motor " + motorNum + " turned OFF");
+      return;
+    }
+    if (command == "M" + motorNum + "0") {
+      motorDir[i - 1] = 0;
+      Serial.println("Motor " + motorNum + " set to Clockwise");
+      return;
+    }
+    if (command == "M" + motorNum + "1") {
+      motorDir[i - 1] = 1;
+      Serial.println("Motor " + motorNum + " set to Counter-Clockwise");
+      return;
+    }
+  }
+
+  if (command == "ALLON") {
+    for (int i = 0; i < 5; i++) {
+      motorOn[i] = true;
+      encoderCount[i] = 0;
+    }
+    Serial.println("All motors turned ON");
+    return;
+  }
+
+  if (command == "ALLOFF") {
+    for (int i = 0; i < 5; i++) motorOn[i] = false;
+    Serial.println("All motors turned OFF");
+    return;
+  }
+
+  Serial.println("Unknown command");
+}
+
+void serialEvent() {
+  while (Serial.available()) {
+    char inChar = (char)Serial.read();
+    if (inChar != '\n' && inChar != '\r') inputString += inChar;
+    if (inChar == '\n') stringComplete = true;
+  }
+}
+
+void motorControl(int dir, int vel) {
+  int delTime = vel;
+  if (dir == 0) {
+    delay(delTime); digitalWrite(HIN1, LOW); digitalWrite(LIN1, HIGH);
+    delay(delTime); digitalWrite(HIN2, HIGH); digitalWrite(LIN2, LOW);
+    delay(delTime); digitalWrite(HIN3, LOW); digitalWrite(LIN3, HIGH);
+    delay(delTime); digitalWrite(HIN1, HIGH); digitalWrite(LIN1, LOW);
+    delay(delTime); digitalWrite(HIN2, LOW); digitalWrite(LIN2, HIGH);
+    delay(delTime); digitalWrite(HIN3, HIGH); digitalWrite(LIN3, LOW);
+  } else {
+    delay(delTime); digitalWrite(HIN1, LOW); digitalWrite(LIN1, HIGH);
+    delay(delTime); digitalWrite(HIN3, HIGH); digitalWrite(LIN3, LOW);
+    delay(delTime); digitalWrite(HIN2, LOW); digitalWrite(LIN2, HIGH);
+    delay(delTime); digitalWrite(HIN1, HIGH); digitalWrite(LIN1, LOW);
+    delay(delTime); digitalWrite(HIN3, LOW); digitalWrite(LIN3, HIGH);
+    delay(delTime); digitalWrite(HIN2, HIGH); digitalWrite(LIN2, LOW);
+  }
+}
+
+void encoderPollingTask(void *param) {
+  int i = *((int *)param);
+  pinMode(encA[i], INPUT_PULLUP);
+  pinMode(encB[i], INPUT_PULLUP);
+
+  while (true) {
+    int currentA = digitalRead(encA[i]);
+    int currentB = digitalRead(encB[i]);
+
+    if (currentA != lastA[i]) {
+      if (currentA == currentB) encoderCount[i]++;
+      else encoderCount[i]--;
+      lastA[i] = currentA;
+    }
+
+    if (motorOn[i]) {
+      float deg = encoderCount[i] / pulsesPerDegree[i];
+      Serial.printf("Motor %d Encoder Degrees: %.2f\n", i + 1, deg);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
