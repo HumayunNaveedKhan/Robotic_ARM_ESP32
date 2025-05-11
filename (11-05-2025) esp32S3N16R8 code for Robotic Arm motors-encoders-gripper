@@ -79,19 +79,109 @@ void loop() {
 // ---------------------- Command Parser ------------------------
 
 void processCommand(String cmd) {
-  cmd.toUpperCase();
+  cmd.toUpperCase();  // Ensure case insensitivity
 
+  // Motor Control Commands (M1ON to M5ON, M1OFF to M5OFF)
   if (cmd.startsWith("M") && cmd.length() == 3) {
-    int motor = cmd.charAt(1) - '1';
-    int dir = cmd.charAt(2) - '0';
+    int motor = cmd.charAt(1) - '1'; // Extract motor number
+    int dir = cmd.charAt(2) - '0';   // Extract direction (CW or CCW)
     if (motor >= 0 && motor < 5 && (dir == 0 || dir == 1)) {
-      for (int i = 0; i < 5; i++) digitalWrite(RELAY_PINS[i], LOW);
-      digitalWrite(RELAY_PINS[motor], HIGH);
+      for (int i = 0; i < 5; i++) digitalWrite(RELAY_PINS[i], HIGH); // Turn off all motors first
+      digitalWrite(RELAY_PINS[motor], LOW); // Turn the selected motor ON (active low logic)
       activeMotor = motor;
       motorDirection = dir;
       Serial.printf("Motor %d ON %s\n", motor + 1, dir == 0 ? "CW" : "CCW");
     }
   }
+  // Motor 1 ON/OFF Commands
+  else if (cmd.startsWith("M1ON")) {
+    digitalWrite(RELAY_PINS[0], LOW); // Turn motor 1 ON (active low)
+    activeMotor = 0;
+    Serial.println("Motor 1 ON");
+  }
+  else if (cmd.startsWith("M1OFF")) {
+    digitalWrite(RELAY_PINS[0], HIGH); // Turn motor 1 OFF (active low)
+    activeMotor = -1;
+    Serial.println("Motor 1 OFF");
+  }
+  
+  // Motor 2 ON/OFF Commands
+  else if (cmd.startsWith("M2ON")) {
+    digitalWrite(RELAY_PINS[1], LOW); // Turn motor 2 ON (active low)
+    activeMotor = 1;
+    Serial.println("Motor 2 ON");
+  }
+  else if (cmd.startsWith("M2OFF")) {
+    digitalWrite(RELAY_PINS[1], HIGH); // Turn motor 2 OFF (active low)
+    activeMotor = -1;
+    Serial.println("Motor 2 OFF");
+  }
+  
+  // Motor 3 ON/OFF Commands
+  else if (cmd.startsWith("M3ON")) {
+    digitalWrite(RELAY_PINS[2], LOW); // Turn motor 3 ON (active low)
+    activeMotor = 2;
+    Serial.println("Motor 3 ON");
+  }
+  else if (cmd.startsWith("M3OFF")) {
+    digitalWrite(RELAY_PINS[2], HIGH); // Turn motor 3 OFF (active low)
+    activeMotor = -1;
+    Serial.println("Motor 3 OFF");
+  }
+  
+  // Motor 4 ON/OFF Commands
+  else if (cmd.startsWith("M4ON")) {
+    digitalWrite(RELAY_PINS[3], LOW); // Turn motor 4 ON (active low)
+    activeMotor = 3;
+    Serial.println("Motor 4 ON");
+  }
+  else if (cmd.startsWith("M4OFF")) {
+    digitalWrite(RELAY_PINS[3], HIGH); // Turn motor 4 OFF (active low)
+    activeMotor = -1;
+    Serial.println("Motor 4 OFF");
+  }
+  
+  // Motor 5 ON/OFF Commands
+  else if (cmd.startsWith("M5ON")) {
+    digitalWrite(RELAY_PINS[4], LOW); // Turn motor 5 ON (active low)
+    activeMotor = 4;
+    Serial.println("Motor 5 ON");
+  }
+  else if (cmd.startsWith("M5OFF")) {
+    digitalWrite(RELAY_PINS[4], HIGH); // Turn motor 5 OFF (active low)
+    activeMotor = -1;
+    Serial.println("Motor 5 OFF");
+  }
+
+  // All Motors ON/OFF
+  else if (cmd.startsWith("ALLON")) {
+    for (int i = 0; i < 5; i++) {
+      digitalWrite(RELAY_PINS[i], LOW); // Turn all motors ON (active low)
+    }
+    activeMotor = -1;  // No specific active motor
+    Serial.println("All motors ON");
+  }
+  else if (cmd.startsWith("ALLOFF")) {
+    for (int i = 0; i < 5; i++) {
+      digitalWrite(RELAY_PINS[i], HIGH); // Turn all motors OFF (active low)
+    }
+    activeMotor = -1;  // No specific active motor
+    Serial.println("All motors OFF");
+  }
+
+  // Gripper Control Commands
+  else if (cmd.startsWith("GRIPPEROPEN")) {
+    digitalWrite(GRIPPER_PIN1, HIGH); // Open the gripper
+    digitalWrite(GRIPPER_PIN2, LOW);  // Open the gripper
+    Serial.println("Gripper OPEN");
+  }
+  else if (cmd.startsWith("GRIPPERCLOSE")) {
+    digitalWrite(GRIPPER_PIN1, LOW);  // Close the gripper
+    digitalWrite(GRIPPER_PIN2, HIGH); // Close the gripper
+    Serial.println("Gripper CLOSE");
+  }
+  
+  // Gripper with Timed Control
   else if (cmd.startsWith("C") && cmd.indexOf("T") > 1) {
     int tIndex = cmd.indexOf("T");
     gripperState = cmd.substring(1, tIndex).toInt();
@@ -102,6 +192,9 @@ void processCommand(String cmd) {
     }
   }
 }
+
+
+
 
 // ---------------------- Motor Task ------------------------
 
@@ -159,14 +252,19 @@ void gripperTask(void* pvParameters) {
 // ---------------------- Encoder ISRs & Handler ------------------------
 
 void IRAM_ATTR encoderHandler(int i) {
-  unsigned long now = millis();
-  if (now - lastEncTime[i] >= DEBOUNCE_MS) {
-    int A = digitalRead(ENCA_PINS[i]);
-    int B = digitalRead(ENCB_PINS[i]);
-    encoderPulses[i] += (A == B) ? 1 : -1;
-    lastEncTime[i] = now;
+  // Only count encoder if this motor is active
+  if (i == activeMotor) {
+    unsigned long now = millis();
+    if (now - lastEncTime[i] >= DEBOUNCE_MS) {
+      int A = digitalRead(ENCA_PINS[i]);
+      int B = digitalRead(ENCB_PINS[i]);
+      if (A == B) encoderPulses[i]++;
+      else encoderPulses[i]--;
+      lastEncTime[i] = now;
+    }
   }
 }
+
 
 void IRAM_ATTR encoderISR0() { encoderHandler(0); }
 void IRAM_ATTR encoderISR1() { encoderHandler(1); }
