@@ -1,0 +1,203 @@
+#include <Arduino.h>
+
+// ---------------------- Forward Declarations ------------------------
+void IRAM_ATTR encoderHandler(int i);
+void IRAM_ATTR encoderISR0();
+void IRAM_ATTR encoderISR1();
+void IRAM_ATTR encoderISR2();
+void IRAM_ATTR encoderISR3();
+void IRAM_ATTR encoderISR4();
+void (*getEncoderISR(int index))();
+
+// ---------------------- Motor & Encoder Config ----------------------
+
+const int RELAY_PINS[] = {17, 18, 8, 11, 12};
+const int ENCA_PINS[] = {19, 21, 36, 38, 1};
+const int ENCB_PINS[] = {20, 35, 37, 39, 2};
+
+#define HIN1 4
+#define LIN1 5
+#define HIN2 9
+#define LIN2 10
+#define HIN3 15
+#define LIN3 16
+
+// Gripper Pins
+#define GRIPPER_PIN1 13
+#define GRIPPER_PIN2 14
+
+// Global Variables
+volatile long encoderPulses[5] = {0};
+volatile unsigned long lastEncTime[5] = {0};  // For debouncing
+const unsigned long DEBOUNCE_MS = 10;
+
+int activeMotor = -1;
+int motorDirection = 0;
+
+bool gripperCommandReceived = false;
+int gripperState = 0;  // 0=open, 1=close
+int gripperTime = 0;
+
+// Task Handles
+TaskHandle_t motorTaskHandle, gripperTaskHandle, statusTaskHandle;
+
+// ---------------------- Setup ------------------------
+
+void setup() {
+  Serial.begin(115200);
+
+  for (int i = 0; i < 5; i++) {
+    pinMode(RELAY_PINS[i], OUTPUT);
+    digitalWrite(RELAY_PINS[i], LOW);
+    pinMode(ENCA_PINS[i], INPUT);
+    pinMode(ENCB_PINS[i], INPUT);
+    attachInterrupt(digitalPinToInterrupt(ENCA_PINS[i]), getEncoderISR(i), CHANGE);
+  }
+
+  pinMode(HIN1, OUTPUT); pinMode(LIN1, OUTPUT);
+  pinMode(HIN2, OUTPUT); pinMode(LIN2, OUTPUT);
+  pinMode(HIN3, OUTPUT); pinMode(LIN3, OUTPUT);
+
+  pinMode(GRIPPER_PIN1, OUTPUT);
+  pinMode(GRIPPER_PIN2, OUTPUT);
+  digitalWrite(GRIPPER_PIN1, LOW);
+  digitalWrite(GRIPPER_PIN2, LOW);
+
+  xTaskCreatePinnedToCore(motorTask, "MotorTask", 4096, NULL, 1, &motorTaskHandle, 1);
+  xTaskCreatePinnedToCore(gripperTask, "GripperTask", 2048, NULL, 1, &gripperTaskHandle, 1);
+  xTaskCreatePinnedToCore(statusReportTask, "StatusReport", 2048, NULL, 1, &statusTaskHandle, 0);
+}
+
+void loop() {
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    processCommand(cmd);
+  }
+}
+
+// ---------------------- Command Parser ------------------------
+
+void processCommand(String cmd) {
+  cmd.toUpperCase();
+
+  if (cmd.startsWith("M") && cmd.length() == 3) {
+    int motor = cmd.charAt(1) - '1';
+    int dir = cmd.charAt(2) - '0';
+    if (motor >= 0 && motor < 5 && (dir == 0 || dir == 1)) {
+      for (int i = 0; i < 5; i++) digitalWrite(RELAY_PINS[i], LOW);
+      digitalWrite(RELAY_PINS[motor], HIGH);
+      activeMotor = motor;
+      motorDirection = dir;
+      Serial.printf("Motor %d ON %s\n", motor + 1, dir == 0 ? "CW" : "CCW");
+    }
+  }
+  else if (cmd.startsWith("C") && cmd.indexOf("T") > 1) {
+    int tIndex = cmd.indexOf("T");
+    gripperState = cmd.substring(1, tIndex).toInt();
+    gripperTime = cmd.substring(tIndex + 1).toInt();
+    if ((gripperState == 0 || gripperState == 1) && gripperTime > 0) {
+      gripperCommandReceived = true;
+      Serial.printf("Gripper Command: %s for %d sec\n", gripperState ? "CLOSE" : "OPEN", gripperTime);
+    }
+  }
+}
+
+// ---------------------- Motor Task ------------------------
+
+void motorTask(void* pvParameters) {
+  int step = 0;
+  while (1) {
+    if (activeMotor != -1) {
+      motorControl(motorDirection, step);
+      step = (step + 1) % 6;
+      vTaskDelay(pdMS_TO_TICKS(100));
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
+  }
+}
+
+void motorControl(int dir, int step) {
+  if (dir == 0) {
+    switch (step) {
+      case 0: digitalWrite(HIN1, LOW); digitalWrite(LIN1, HIGH); break;
+      case 1: digitalWrite(HIN2, HIGH); digitalWrite(LIN2, LOW); break;
+      case 2: digitalWrite(HIN3, LOW); digitalWrite(LIN3, HIGH); break;
+      case 3: digitalWrite(HIN1, HIGH); digitalWrite(LIN1, LOW); break;
+      case 4: digitalWrite(HIN2, LOW); digitalWrite(LIN2, HIGH); break;
+      case 5: digitalWrite(HIN3, HIGH); digitalWrite(LIN3, LOW); break;
+    }
+  } else {
+    switch (step) {
+      case 0: digitalWrite(HIN3, HIGH); digitalWrite(LIN3, LOW); break;
+      case 1: digitalWrite(HIN2, LOW); digitalWrite(LIN2, HIGH); break;
+      case 2: digitalWrite(HIN1, HIGH); digitalWrite(LIN1, LOW); break;
+      case 3: digitalWrite(HIN3, LOW); digitalWrite(LIN3, HIGH); break;
+      case 4: digitalWrite(HIN2, HIGH); digitalWrite(LIN2, LOW); break;
+      case 5: digitalWrite(HIN1, LOW); digitalWrite(LIN1, HIGH); break;
+    }
+  }
+}
+
+// ---------------------- Gripper Task ------------------------
+
+void gripperTask(void* pvParameters) {
+  while (1) {
+    if (gripperCommandReceived) {
+      digitalWrite(GRIPPER_PIN1, gripperState == 1 ? HIGH : LOW);
+      digitalWrite(GRIPPER_PIN2, gripperState == 0 ? HIGH : LOW);
+      vTaskDelay(pdMS_TO_TICKS(gripperTime * 1000));
+      digitalWrite(GRIPPER_PIN1, LOW);
+      digitalWrite(GRIPPER_PIN2, LOW);
+      gripperCommandReceived = false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// ---------------------- Encoder ISRs & Handler ------------------------
+
+void IRAM_ATTR encoderHandler(int i) {
+  unsigned long now = millis();
+  if (now - lastEncTime[i] >= DEBOUNCE_MS) {
+    int A = digitalRead(ENCA_PINS[i]);
+    int B = digitalRead(ENCB_PINS[i]);
+    encoderPulses[i] += (A == B) ? 1 : -1;
+    lastEncTime[i] = now;
+  }
+}
+
+void IRAM_ATTR encoderISR0() { encoderHandler(0); }
+void IRAM_ATTR encoderISR1() { encoderHandler(1); }
+void IRAM_ATTR encoderISR2() { encoderHandler(2); }
+void IRAM_ATTR encoderISR3() { encoderHandler(3); }
+void IRAM_ATTR encoderISR4() { encoderHandler(4); }
+
+void (*getEncoderISR(int index))() {
+  switch (index) {
+    case 0: return encoderISR0;
+    case 1: return encoderISR1;
+    case 2: return encoderISR2;
+    case 3: return encoderISR3;
+    case 4: return encoderISR4;
+    default: return NULL;
+  }
+}
+
+// ---------------------- Status Reporting ------------------------
+
+void statusReportTask(void* pvParameters) {
+  while (1) {
+    Serial.print("Motor: ");
+    Serial.print(activeMotor + 1);
+    Serial.print(" | Dir: ");
+    Serial.print(motorDirection == 0 ? "CW" : "CCW");
+    Serial.print(" | Encoders: ");
+    for (int i = 0; i < 5; i++) {
+      Serial.printf("M%d: %ld ", i + 1, encoderPulses[i]);
+    }
+    Serial.println();
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
