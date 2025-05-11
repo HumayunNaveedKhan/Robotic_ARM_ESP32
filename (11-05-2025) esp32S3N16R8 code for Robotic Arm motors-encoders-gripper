@@ -37,7 +37,7 @@ const unsigned long DEBOUNCE_MS = 10;
 
 int activeMotor = -1;
 int motorDirection = 0;
-int motorSpeed = 20;  // Default motor speed (lower = faster)
+int motorSpeed = 12;  // Default motor speed (lower = faster)
 
 bool gripperCommandReceived = false;
 int gripperState = 0;  // 0=open, 1=close
