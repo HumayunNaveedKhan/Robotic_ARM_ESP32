@@ -4,31 +4,31 @@
 #include <freertos/queue.h>
 
 // IR2130 Gate Driver pins
-#define HIN1 19
-#define HIN2 18
-#define HIN3 5
-#define LIN1 17
-#define LIN2 16
-#define LIN3 4
+#define HIN1 4
+#define HIN2 5
+#define HIN3 9
+#define LIN1 10
+#define LIN2 15
+#define LIN3 16
 
 // Relay pins for motor control (Active LOW)
-#define RELAY1 26
-#define RELAY2 27
-#define RELAY3 14
-#define RELAY4 12
-#define RELAY5 13
+#define RELAY1 17
+#define RELAY2 18
+#define RELAY3 8
+#define RELAY4 11
+#define RELAY5 12
 
 // Encoder pins
-#define ENC1_A 25
-#define ENC1_B 33
-#define ENC2_A 32
+#define ENC1_A 19
+#define ENC1_B 20
+#define ENC2_A 21
 #define ENC2_B 35
-#define ENC3_A 34
-#define ENC3_B 39
-#define ENC4_A 36
-#define ENC4_B 23
-#define ENC5_A 22
-#define ENC5_B 21
+#define ENC3_A 36
+#define ENC3_B 37
+#define ENC4_A 38
+#define ENC4_B 39
+#define ENC5_A 1
+#define ENC5_B 2
 
 // Arrays for easy access to pins
 const int RELAY_PINS[5] = {RELAY1, RELAY2, RELAY3, RELAY4, RELAY5};
