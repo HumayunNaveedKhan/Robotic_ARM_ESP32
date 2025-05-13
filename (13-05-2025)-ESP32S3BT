@@ -1,0 +1,503 @@
+#include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <esp_task_wdt.h>
+#include <BluetoothSerial.h>
+
+// Bluetooth Serial instance
+BluetoothSerial SerialBT;
+
+// IR2130 Gate Driver pins
+#define HIN1 4
+#define HIN2 5
+#define HIN3 9
+#define LIN1 10
+#define LIN2 15
+#define LIN3 16
+
+// Relay pins for motor control (Active LOW)
+#define RELAY1 17
+#define RELAY2 18
+#define RELAY3 8
+#define RELAY4 11
+#define RELAY5 12
+
+// Arrays for easy access to pins
+const int RELAY_PINS[5] = {RELAY1, RELAY2, RELAY3, RELAY4, RELAY5};
+
+// Motor state variables
+volatile int activeMotor = -1;          // Which motor is currently active (-1 = none)
+volatile bool motorRunning = false;     // Is the motor currently running
+volatile int motorDirection = 0;        // 0 = CW, 1 = CCW
+int motorDelays[5] = {77, 77, 77, 77, 77};  // Default delay 77ms for 13Hz
+int motorDutyCycles[5] = {50, 50, 50, 50, 50};  // Default duty cycle 50%
+const int DEAD_TIME_US = 1000;  // 1ms dead-time for IR2130
+
+// Command structure
+typedef struct {
+  int motorNum;    // 1-5 for specific motor, 0 for none
+  bool turnOn;     // true = ON, false = OFF
+  int direction;   // 0 = CW, 1 = CCW, -1 = no change
+  int delay;       // Delay in ms for motor speed, 0 = no change
+  int dutyCycle;   // Duty cycle %, 0 = no change
+} MotorCommand_t;
+
+// FreeRTOS handles
+TaskHandle_t motorTaskHandle = NULL;
+TaskHandle_t statusTaskHandle = NULL;
+QueueHandle_t commandQueue;
+
+String inputString = "";
+String btInputString = "";
+bool stringComplete = false;
+bool btStringComplete = false;
+
+// Function prototypes
+void motorControlTask(void* pvParameters);
+void statusReportTask(void* pvParameters);
+void motorControl(int dir, int step, int delay_ms, int duty_cycle);
+void processCommand(String command);
+
+void setup() {
+  Serial.begin(115200);
+  SerialBT.begin("ESP32_RobotArm");  // Unique Bluetooth name
+  Serial.println("Single Motor Control System Ready - Bluetooth: ESP32_RobotArm");
+  inputString.reserve(50);  // Increased buffer size
+  btInputString.reserve(50);  // Buffer for Bluetooth input
+
+  // Initialize watchdog timer
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = 5000,       // 5s timeout
+    .idle_core_mask = 0x3,    // Apply to both cores
+    .trigger_panic = true     // Reset on timeout
+  };
+  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_add(NULL);  // Add main task to watchdog
+
+  // Create command queue
+  commandQueue = xQueueCreate(5, sizeof(MotorCommand_t));
+  if (commandQueue == NULL) {
+    Serial.println("Failed to create command queue");
+    SerialBT.println("Failed to create command queue");
+    while (1);
+  }
+
+  // Configure driver pins
+  pinMode(HIN1, OUTPUT); pinMode(HIN2, OUTPUT); pinMode(HIN3, OUTPUT);
+  pinMode(LIN1, OUTPUT); pinMode(LIN2, OUTPUT); pinMode(LIN3, OUTPUT);
+  digitalWrite(HIN1, LOW); digitalWrite(HIN2, LOW); digitalWrite(HIN3, LOW);
+  digitalWrite(LIN1, LOW); digitalWrite(LIN2, LOW); digitalWrite(LIN3, LOW);
+
+  // Configure relay pins (active LOW)
+  for (int i = 0; i < 5; i++) {
+    pinMode(RELAY_PINS[i], OUTPUT);
+    digitalWrite(RELAY_PINS[i], HIGH); // Relays off initially
+  }
+
+  // Create motor control task on core 1
+  xTaskCreatePinnedToCore(
+    motorControlTask,
+    "MotorTask",
+    8192,  // Increased stack size
+    NULL,
+    1,
+    &motorTaskHandle,
+    1    // Run on core 1
+  );
+
+  // Create status reporting task on core 0
+  xTaskCreatePinnedToCore(
+    statusReportTask,
+    "StatusTask",
+    4096,  // Increased stack size
+    NULL,
+    1,
+    &statusTaskHandle,
+    0    // Run on core 0
+  );
+}
+
+void loop() {
+  // Read USB Serial commands
+  while (Serial.available()) {
+    char inChar = (char)Serial.read();
+    if (inChar != '\n' && inChar != '\r') {
+      if (inputString.length() < 50) {  // Prevent buffer overflow
+        inputString += inChar;
+      }
+    }
+    if (inChar == '\n') {
+      stringComplete = true;
+    }
+    esp_task_wdt_reset();  // Feed watchdog
+  }
+
+  // Read Bluetooth Serial commands
+  while (SerialBT.available()) {
+    char inChar = (char)SerialBT.read();
+    if (inChar != '\n' && inChar != '\r') {
+      if (btInputString.length() < 50) {  // Prevent buffer overflow
+        btInputString += inChar;
+      }
+    }
+    if (inChar == '\n') {
+      btStringComplete = true;
+    }
+    esp_task_wdt_reset();  // Feed watchdog
+  }
+
+  // Process USB Serial commands
+  if (stringComplete) {
+    processCommand(inputString);
+    inputString = "";
+    stringComplete = false;
+  }
+
+  // Process Bluetooth commands
+  if (btStringComplete) {
+    Serial.println("Bluetooth Received: " + btInputString);
+    SerialBT.println("Received: " + btInputString);  // Echo back to app
+    processCommand(btInputString);
+    btInputString = "";
+    btStringComplete = false;
+  }
+
+  vTaskDelay(pdMS_TO_TICKS(10));  // Yield to other tasks
+  esp_task_wdt_reset();  // Feed watchdog
+}
+
+void processCommand(String command) {
+  command.trim();
+  command.toUpperCase();
+  Serial.print("Command received: ");
+  Serial.println(command);
+  SerialBT.print("Command received: ");
+  SerialBT.println(command);
+
+  MotorCommand_t cmd;
+  cmd.turnOn = false;
+  cmd.direction = -1;  // No change by default
+  cmd.motorNum = 0;    // No motor by default
+  cmd.delay = 0;
+  cmd.dutyCycle = 0;
+
+  // Check for individual motor commands
+  for (int i = 1; i <= 5; i++) {
+    String motorNum = String(i);
+    
+    if (command == "M" + motorNum + "ON") {
+      cmd.motorNum = i;
+      cmd.turnOn = true;
+      xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+      Serial.println("Motor " + motorNum + " turning ON");
+      SerialBT.println("Motor " + motorNum + " turning ON");
+      return;
+    }
+    if (command == "M" + motorNum + "OFF") {
+      cmd.motorNum = i;
+      cmd.turnOn = false;
+      xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+      Serial.println("Motor " + motorNum + " turning OFF");
+      SerialBT.println("Motor " + motorNum + " turning OFF");
+      return;
+    }
+    if (command == "M" + motorNum + "0" || command == "M" + motorNum + "CW") {
+      cmd.motorNum = i;
+      cmd.direction = 0;
+      cmd.turnOn = true;  // Ensure motor runs
+      xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+      Serial.println("Motor " + motorNum + " set to Clockwise");
+      SerialBT.println("Motor " + motorNum + " set to Clockwise");
+      return;
+    }
+    if (command == "M" + motorNum + "1" || command == "M" + motorNum + "CCW") {
+      cmd.motorNum = i;
+      cmd.direction = 1;
+      cmd.turnOn = true;  // Ensure motor runs
+      xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+      Serial.println("Motor " + motorNum + " set to Counter-Clockwise");
+      SerialBT.println("Motor " + motorNum + " set to Counter-Clockwise");
+      return;
+    }
+    if (command.startsWith("M" + motorNum + "S")) {
+      int sIndex = command.indexOf("S");
+      int delay = command.substring(sIndex + 1).toInt();
+      if (delay >= 1 && delay <= 1000) {  // Allow up to 1000ms
+        cmd.motorNum = i;
+        cmd.delay = delay;
+        xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+        Serial.printf("Motor %d delay set to %d ms\n", i, delay);
+        SerialBT.printf("Motor %d delay set to %d ms\n", i, delay);
+        return;
+      }
+    }
+    if (command.startsWith("M" + motorNum + "D")) {
+      int dIndex = command.indexOf("D");
+      int duty = command.substring(dIndex + 1).toInt();
+      if (duty >= 10 && duty <= 90) {  // Limit to 10-90% for safety
+        cmd.motorNum = i;
+        cmd.dutyCycle = duty;
+        xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+        Serial.printf("Motor %d duty cycle set to %d%%\n", i, duty);
+        SerialBT.printf("Motor %d duty cycle set to %d%%\n", i, duty);
+        return;
+      }
+    }
+  }
+
+  if (command == "ALLOFF") {
+    cmd.motorNum = 0;
+    cmd.turnOn = false;
+    xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+    Serial.println("Turning OFF all motors");
+    SerialBT.println("Turning OFF all motors");
+    return;
+  }
+
+  if (command == "STATUS") {
+    String status = String("Status - Active Motor: ") + (activeMotor + 1) +
+                   ", Running: " + (motorRunning ? "YES" : "NO") +
+                   ", Direction: " + (motorDirection == 0 ? "CW" : "CCW") +
+                   ", Delay: " + (activeMotor >= 0 ? String(motorDelays[activeMotor]) : "0") + "ms" +
+                   ", Duty: " + (activeMotor >= 0 ? String(motorDutyCycles[activeMotor]) : "0") + "%";
+    Serial.println(status);
+    SerialBT.println(status);
+    return;
+  }
+
+  Serial.println("Invalid command");
+  SerialBT.println("Invalid command");
+  esp_task_wdt_reset();  // Feed watchdog
+}
+
+void motorControlTask(void* pvParameters) {
+  MotorCommand_t cmd;
+  static int step = 0;
+
+  esp_task_wdt_add(NULL);  // Add task to watchdog
+
+  while (1) {
+    // Check for new commands with a short timeout
+    if (xQueueReceive(commandQueue, &cmd, pdMS_TO_TICKS(10)) == pdTRUE) {
+      if (cmd.motorNum == 0) {
+        // Turn off any active motor
+        if (activeMotor >= 0) {
+          digitalWrite(RELAY_PINS[activeMotor], HIGH);  // Turn off relay
+          digitalWrite(HIN1, LOW); digitalWrite(LIN1, LOW);
+          digitalWrite(HIN2, LOW); digitalWrite(LIN2, LOW);
+          digitalWrite(HIN3, LOW); digitalWrite(LIN3, LOW);
+          motorRunning = false;
+          activeMotor = -1;
+          step = 0;  // Reset step
+        }
+      } else {
+        // Handle specific motor command
+        int motorIndex = cmd.motorNum - 1;
+        
+        // Turn off current motor if different
+        if (activeMotor >= 0 && activeMotor != motorIndex) {
+          digitalWrite(RELAY_PINS[activeMotor], HIGH);
+          digitalWrite(HIN1, LOW); digitalWrite(LIN1, LOW);
+          digitalWrite(HIN2, LOW); digitalWrite(LIN2, LOW);
+          digitalWrite(HIN3, LOW); digitalWrite(LIN3, LOW);
+          motorRunning = false;
+        }
+        
+        // Update motor state
+        activeMotor = motorIndex;
+        
+        // Update direction if specified
+        if (cmd.direction >= 0) {
+          motorDirection = cmd.direction;
+        }
+        
+        // Update delay if specified
+        if (cmd.delay > 0) {
+          motorDelays[motorIndex] = cmd.delay;
+        }
+        
+        // Update duty cycle if specified
+        if (cmd.dutyCycle > 0) {
+          motorDutyCycles[motorIndex] = cmd.dutyCycle;
+        }
+        
+        // Update motor running state
+        motorRunning = cmd.turnOn;
+        digitalWrite(RELAY_PINS[motorIndex], motorRunning ? LOW : HIGH);
+        
+        // Reset step when turning on
+        if (cmd.turnOn) {
+          step = 0;
+        }
+      }
+    }
+    
+    // Drive the active motor if it's running
+    if (motorRunning && activeMotor >= 0) {
+      motorControl(motorDirection, step, motorDelays[activeMotor], motorDutyCycles[activeMotor]);
+      step = (step + 1) % 6;
+      vTaskDelay(pdMS_TO_TICKS(motorDelays[activeMotor]));  // Respect 77ms period
+    } else {
+      // Ensure all outputs are off when not running
+      digitalWrite(HIN1, LOW); digitalWrite(LIN1, LOW);
+      digitalWrite(HIN2, LOW); digitalWrite(LIN2, LOW);
+      digitalWrite(HIN3, LOW); digitalWrite(LIN3, LOW);
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    esp_task_wdt_reset();  // Feed watchdog
+  }
+}
+
+void motorControl(int dir, int step, int delay_ms, int duty_cycle) {
+  // Calculate on-time based on duty cycle (in microseconds)
+  int on_time_us = (delay_ms * 1000 * duty_cycle) / 100;
+  int total_dead_time_us = 2 * DEAD_TIME_US;  // Dead-time on both transitions
+  int off_time_us = (delay_ms * 1000) - on_time_us - total_dead_time_us;
+
+  if (off_time_us < 0) {
+    off_time_us = 0;  // Prevent negative off-time
+    on_time_us = (delay_ms * 1000) - total_dead_time_us;  // Adjust on-time
+  }
+
+  // Map reference logic to HINx/LINx pairs
+  auto setPinState = [](int hin, int lin, bool state) {
+    if (state) {  // pinX HIGH -> HINx HIGH, LINx LOW
+      digitalWrite(hin, HIGH);
+      digitalWrite(lin, LOW);
+    } else {  // pinX LOW -> HINx LOW, LINx HIGH
+      digitalWrite(hin, LOW);
+      digitalWrite(lin, HIGH);
+    }
+  };
+
+  if (dir == 0) { // CW: pin1 LOW, pin2 HIGH, pin3 LOW, pin1 HIGH, pin2 LOW, pin3 HIGH
+    switch (step) {
+      case 0:
+        setPinState(HIN1, LIN1, LOW);  // pin1 LOW
+        delayMicroseconds(on_time_us);
+        digitalWrite(HIN1, LOW); digitalWrite(LIN1, LOW);  // Turn off
+        delayMicroseconds(DEAD_TIME_US);  // Dead-time
+        delayMicroseconds(off_time_us);
+        delayMicroseconds(DEAD_TIME_US);  // Second dead-time
+        break;
+      case 1:
+        setPinState(HIN2, LIN2, HIGH);  // pin2 HIGH
+        delayMicroseconds(on_time_us);
+        digitalWrite(HIN2, LOW); digitalWrite(LIN2, LOW);  // Turn off
+        delayMicroseconds(DEAD_TIME_US);  // Dead-time
+        delayMicroseconds(off_time_us);
+        delayMicroseconds(DEAD_TIME_US);  // Second dead-time
+        break;
+      case 2:
+        setPinState(HIN3, LIN3, LOW);  // pin3 LOW
+        delayMicroseconds(on_time_us);
+        digitalWrite(HIN3, LOW); digitalWrite(LIN3, LOW);  // Turn off
+        delayMicroseconds(DEAD_TIME_US);  // Dead-time
+        delayMicroseconds(off_time_us);
+        delayMicroseconds(DEAD_TIME_US);  // Second dead-time
+        break;
+      case 3:
+        setPinState(HIN1, LIN1, HIGH);  // pin1 HIGH
+        delayMicroseconds(on_time_us);
+        digitalWrite(HIN1, LOW); digitalWrite(LIN1, LOW);  // Turn off
+        delayMicroseconds(DEAD_TIME_US);  // Dead-time
+        delayMicroseconds(off_time_us);
+        delayMicroseconds(DEAD_TIME_US);  // Second dead-time
+        break;
+      case 4:
+        setPinState(HIN2, LIN2, LOW);  // pin2 LOW
+        delayMicroseconds(on_time_us);
+        digitalWrite(HIN2, LOW); digitalWrite(LIN2, LOW);  // Turn off
+        delayMicroseconds(DEAD_TIME_US);  // Dead-time
+        delayMicroseconds(off_time_us);
+        delayMicroseconds(DEAD_TIME_US);  // Second dead-time
+        break;
+      case 5:
+        setPinState(HIN3, LIN3, HIGH);  // pin3 HIGH
+        delayMicroseconds(on_time_us);
+        digitalWrite(HIN3, LOW); digitalWrite(LIN3, LOW);  // Turn off
+        delayMicroseconds(DEAD_TIME_US);  // Dead-time
+        delayMicroseconds(off_time_us);
+        delayMicroseconds(DEAD_TIME_US);  // Second dead-time
+        break;
+    }
+  } else { // CCW: pin1 LOW, pin3 HIGH, pin2 LOW, pin1 HIGH, pin3 LOW, pin2 HIGH
+    switch (step) {
+      case 0:
+        setPinState(HIN1, LIN1, LOW);  // pin1 LOW
+        delayMicroseconds(on_time_us);
+        digitalWrite(HIN1, LOW); digitalWrite(LIN1, LOW);  // Turn off
+        delayMicroseconds(DEAD_TIME_US);  // Dead-time
+        delayMicroseconds(off_time_us);
+        delayMicroseconds(DEAD_TIME_US);  // Second dead-time
+        break;
+      case 1:
+        setPinState(HIN3, LIN3, HIGH);  // pin3 HIGH
+        delayMicroseconds(on_time_us);
+        digitalWrite(HIN3, LOW); digitalWrite(LIN3, LOW);  // Turn off
+        delayMicroseconds(DEAD_TIME_US);  // Dead-time
+        delayMicroseconds(off_time_us);
+        delayMicroseconds(DEAD_TIME_US);  // Second dead-time
+        break;
+      case 2:
+        setPinState(HIN2, LIN2, LOW);  // pin2 LOW
+        delayMicroseconds(on_time_us);
+        digitalWrite(HIN2, LOW); digitalWrite(LIN2, LOW);  // Turn off
+        delayMicroseconds(DEAD_TIME_US);  // Dead-time
+        delayMicroseconds(off_time_us);
+        delayMicroseconds(DEAD_TIME_US);  // Second dead-time
+        break;
+      case 3:
+        setPinState(HIN1, LIN1, HIGH);  // pin1 HIGH
+        delayMicroseconds(on_time_us);
+        digitalWrite(HIN1, LOW); digitalWrite(LIN1, LOW);  // Turn off
+        delayMicroseconds(DEAD_TIME_US);  // Dead-time
+        delayMicroseconds(off_time_us);
+        delayMicroseconds(DEAD_TIME_US);  // Second dead-time
+        break;
+      case 4:
+        setPinState(HIN3, LIN3, LOW);  // pin3 LOW
+        delayMicroseconds(on_time_us);
+        digitalWrite(HIN3, LOW); digitalWrite(LIN3, LOW);  // Turn off
+        delayMicroseconds(DEAD_TIME_US);  // Dead-time
+        delayMicroseconds(off_time_us);
+        delayMicroseconds(DEAD_TIME_US);  // Second dead-time
+        break;
+      case 5:
+        setPinState(HIN2, LIN2, HIGH);  // pin2 HIGH
+        delayMicroseconds(on_time_us);
+        digitalWrite(HIN2, LOW); digitalWrite(LIN2, LOW);  // Turn off
+        delayMicroseconds(DEAD_TIME_US);  // Dead-time
+        delayMicroseconds(off_time_us);
+        delayMicroseconds(DEAD_TIME_US);  // Second dead-time
+        break;
+    }
+  }
+}
+
+void statusReportTask(void* pvParameters) {
+  esp_task_wdt_add(NULL);  // Add task to watchdog
+
+  while (1) {
+    if (motorRunning && activeMotor >= 0) {
+      String status = String("Motor ") + (activeMotor + 1) + ": Running, Dir: " +
+                     (motorDirection == 0 ? "CW" : "CCW") + ", Delay: " +
+                     motorDelays[activeMotor] + "ms, Duty: " +
+                     motorDutyCycles[activeMotor] + "%";
+      Serial.println(status);
+      SerialBT.println(status);
+    } else {
+      String status = String("No active motor | Delays: M1:") + motorDelays[0] + "ms M2:" +
+                     motorDelays[1] + "ms M3:" + motorDelays[2] + "ms M4:" +
+                     motorDelays[3] + "ms M5:" + motorDelays[4] + "ms | Duty: M1:" +
+                     motorDutyCycles[0] + "% M2:" + motorDutyCycles[1] + "% M3:" +
+                     motorDutyCycles[2] + "% M4:" + motorDutyCycles[3] + "% M5:" +
+                     motorDutyCycles[4] + "%";
+      Serial.println(status);
+      SerialBT.println(status);
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));  // Report every second
+    esp_task_wdt_reset();  // Feed watchdog
+  }
+}
