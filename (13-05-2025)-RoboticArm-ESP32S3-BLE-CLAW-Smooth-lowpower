@@ -1,0 +1,295 @@
+#include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+
+// IR2130 Gate Driver pins
+#define HIN1 4
+#define HIN2 5
+#define HIN3 9
+#define LIN1 10
+#define LIN2 15
+#define LIN3 16
+
+// Relay pins for motor control (Active LOW)
+#define RELAY1 17
+#define RELAY2 18
+#define RELAY3 8
+#define RELAY4 11
+#define RELAY5 12
+
+// Claw motor control pins (L298N)
+#define CLAW_IN1 13
+#define CLAW_IN2 14
+
+// Arrays for easy access to pins
+const int RELAY_PINS[5] = {RELAY1, RELAY2, RELAY3, RELAY4, RELAY5};
+
+// Motor state variables
+volatile int activeMotor = -1;          // Which motor is currently active (-1 = none)
+volatile bool motorRunning = false;     // Is the motor currently running
+volatile int motorDirection = 0;        // 0 = CW, 1 = CCW
+
+// Claw state variable
+volatile bool clawClosed = false;       // Claw state: false = open, true = closed
+
+// Command structure
+typedef struct {
+  int motorNum;    // 1-5 for specific motor, 0 for none
+  bool turnOn;     // true = ON, false = OFF
+  int direction;   // 0 = CW, 1 = CCW, -1 = no change
+} MotorCommand_t;
+
+// FreeRTOS handles
+TaskHandle_t motorTaskHandle = NULL;
+QueueHandle_t commandQueue;
+
+String inputString = "";
+bool stringComplete = false;
+
+// Function prototypes
+void motorControlTask(void* pvParameters);
+void statusReportTask(void* pvParameters);
+void motorControl(int dir, int vel);
+void controlClaw(bool close);  // Added function prototype
+
+void setup() {
+  Serial.begin(115200);
+  inputString.reserve(20);
+
+  // Create command queue
+  commandQueue = xQueueCreate(5, sizeof(MotorCommand_t));
+
+  // Configure driver pins
+  pinMode(HIN1, OUTPUT); pinMode(HIN2, OUTPUT); pinMode(HIN3, OUTPUT);
+  pinMode(LIN1, OUTPUT); pinMode(LIN2, OUTPUT); pinMode(LIN3, OUTPUT);
+
+  // Initialize all pins to LOW
+  digitalWrite(HIN1, LOW); digitalWrite(HIN2, LOW); digitalWrite(HIN3, LOW);
+  digitalWrite(LIN1, LOW); digitalWrite(LIN2, LOW); digitalWrite(LIN3, LOW);
+
+  // Configure relay pins (active LOW)
+  for (int i = 0; i < 5; i++) {
+    pinMode(RELAY_PINS[i], OUTPUT);
+    digitalWrite(RELAY_PINS[i], HIGH); // Relays off initially
+  }
+
+  // Configure claw motor control pins
+  pinMode(CLAW_IN1, OUTPUT);
+  pinMode(CLAW_IN2, OUTPUT);
+  digitalWrite(CLAW_IN1, LOW);
+  digitalWrite(CLAW_IN2, LOW);
+
+  // Create motor control task on core 1
+  xTaskCreatePinnedToCore(
+    motorControlTask,
+    "MotorTask",
+    4096,
+    NULL,
+    1,
+    &motorTaskHandle,
+    1    // Run on core 1
+  );
+
+  // Create status reporting task on core 0
+  xTaskCreatePinnedToCore(
+    statusReportTask,
+    "StatusTask",
+    2048,
+    NULL,
+    1,
+    NULL,
+    0    // Run on core 0
+  );
+
+  Serial.println("Single Motor Control System Ready");
+}
+
+void loop() {
+  // Read serial commands
+  while (Serial.available()) {
+    char inChar = (char)Serial.read();
+    if (inChar != '\n' && inChar != '\r') {
+      inputString += inChar;
+    }
+    if (inChar == '\n') {
+      stringComplete = true;
+    }
+  }
+
+  if (stringComplete) {
+    processCommand(inputString);
+    inputString = "";
+    stringComplete = false;
+  }
+  
+  delay(10);
+}
+
+// Process incoming serial commands
+void processCommand(String command) {
+  command.trim();
+  command.toUpperCase();
+  Serial.print("Command received: ");
+  Serial.println(command);
+
+  MotorCommand_t cmd;
+  cmd.turnOn = false;
+  cmd.direction = -1;
+  cmd.motorNum = 0;
+
+  // Check for claw commands
+  if (command == "C1") {
+    controlClaw(true);
+    Serial.println("Claw closing");
+    return;
+  }
+  if (command == "C0") {
+    controlClaw(false);
+    Serial.println("Claw opening");
+    return;
+  }
+
+  // Check for individual motor commands
+  for (int i = 1; i <= 5; i++) {
+    String motorNum = String(i);
+    
+    if (command == "M" + motorNum + "ON") {
+      cmd.motorNum = i;
+      cmd.turnOn = true;
+      xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+      Serial.println("Motor " + motorNum + " turning ON");
+      return;
+    }
+    if (command == "M" + motorNum + "OFF") {
+      cmd.motorNum = i;
+      cmd.turnOn = false;
+      xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+      Serial.println("Motor " + motorNum + " turning OFF");
+      return;
+    }
+    if (command == "M" + motorNum + "0" || command == "M" + motorNum + "CW") {
+      cmd.motorNum = i;
+      cmd.direction = 0;
+      xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+      Serial.println("Motor " + motorNum + " set to Clockwise");
+      return;
+    }
+    if (command == "M" + motorNum + "1" || command == "M" + motorNum + "CCW") {
+      cmd.motorNum = i;
+      cmd.direction = 1;
+      xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+      Serial.println("Motor " + motorNum + " set to Counter-Clockwise");
+      return;
+    }
+  }
+
+  if (command == "ALLOFF") {
+    cmd.motorNum = 0;
+    cmd.turnOn = false;
+    xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+    Serial.println("Turning OFF active motor");
+    return;
+  }
+
+  Serial.println("Unknown command");
+}
+
+// Task to handle motor control
+void motorControlTask(void* pvParameters) {
+  MotorCommand_t cmd;
+  const int motorSpeed = 5;
+  
+  while (1) {
+    if (xQueueReceive(commandQueue, &cmd, 0) == pdTRUE) {
+      if (cmd.motorNum == 0) {
+        if (activeMotor >= 0) {
+          digitalWrite(RELAY_PINS[activeMotor], HIGH);
+          activeMotor = -1;
+          motorRunning = false;
+        }
+      } else {
+        int motorIndex = cmd.motorNum - 1;
+        
+        if (activeMotor >= 0 && activeMotor != motorIndex) {
+          digitalWrite(RELAY_PINS[activeMotor], HIGH);
+        }
+        
+        activeMotor = motorIndex;
+        
+        if (cmd.direction >= 0) {
+          motorDirection = cmd.direction;
+        }
+        
+        motorRunning = cmd.turnOn;
+        
+        digitalWrite(RELAY_PINS[motorIndex], motorRunning ? LOW : HIGH);
+      }
+    }
+    
+    if (motorRunning && activeMotor >= 0) {
+      motorControl(motorDirection, motorSpeed);
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+  }
+}
+
+// Motor driving sequence
+void motorControl(int dir, int vel) {
+  int delTime = vel;
+  static int step = 0;
+  
+  if (dir == 0) {
+    switch (step) {
+      case 0: digitalWrite(HIN1, LOW); digitalWrite(LIN1, HIGH); break;
+      case 1: digitalWrite(HIN2, HIGH); digitalWrite(LIN2, LOW); break;
+      case 2: digitalWrite(HIN3, LOW); digitalWrite(LIN3, HIGH); break;
+      case 3: digitalWrite(HIN1, HIGH); digitalWrite(LIN1, LOW); break;
+      case 4: digitalWrite(HIN2, LOW); digitalWrite(LIN2, HIGH); break;
+      case 5: digitalWrite(HIN3, HIGH); digitalWrite(LIN3, LOW); break;
+    }
+  } else {
+    switch (step) {
+      case 0: digitalWrite(HIN1, LOW); digitalWrite(LIN1, HIGH); break;
+      case 1: digitalWrite(HIN3, HIGH); digitalWrite(LIN3, LOW); break;
+      case 2: digitalWrite(HIN2, LOW); digitalWrite(LIN2, HIGH); break;
+      case 3: digitalWrite(HIN1, HIGH); digitalWrite(LIN1, LOW); break;
+      case 4: digitalWrite(HIN3, LOW); digitalWrite(LIN3, HIGH); break;
+      case 5: digitalWrite(HIN2, HIGH); digitalWrite(LIN2, LOW); break;
+    }
+  }
+  
+  step = (step + 1) % 6;
+  vTaskDelay(pdMS_TO_TICKS(delTime));
+}
+
+// Task to periodically report status
+void statusReportTask(void* pvParameters) {
+  while (1) {
+    if (motorRunning && activeMotor >= 0) {
+      Serial.printf("Motor %d: Running, Dir: %s\n", 
+                   activeMotor + 1,
+                   motorDirection == 0 ? "CW" : "CCW");
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+// Claw control function
+void controlClaw(bool close) {
+  if (close) {
+    digitalWrite(CLAW_IN1, HIGH);
+    digitalWrite(CLAW_IN2, LOW);
+  } else {
+    digitalWrite(CLAW_IN1, LOW);
+    digitalWrite(CLAW_IN2, HIGH);
+  }
+
+  // Run claw motor for a fixed short time to fully open/close
+  delay(500);  // Adjust if needed
+  digitalWrite(CLAW_IN1, LOW);
+  digitalWrite(CLAW_IN2, LOW);
+
+  clawClosed = close;
+}
