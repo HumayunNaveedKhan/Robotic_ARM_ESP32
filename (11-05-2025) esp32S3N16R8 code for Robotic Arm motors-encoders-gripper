@@ -17,10 +17,10 @@ const int ENCB_PINS[] = {20, 35, 37, 39, 2};
 
 // Define pins for high and low side drivers
 #define HIN1 4   // Phase A - High side
-#define LIN1 5   // Phase A - Low side
-#define HIN2 9   // Phase B - High side
-#define LIN2 10  // Phase B - Low side
-#define HIN3 15  // Phase C - High side
+#define LIN1 10  // Phase A - Low side
+#define HIN2 5   // Phase B - High side
+#define LIN2 15  // Phase B - Low side
+#define HIN3 9  // Phase C - High side
 #define LIN3 16  // Phase C - Low side
 
 // Lock pin for enabling the driver (from original DRV2130 code)
