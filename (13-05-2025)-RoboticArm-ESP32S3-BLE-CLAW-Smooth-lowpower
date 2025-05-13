@@ -2,6 +2,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
+#include <NimBLEDevice.h>
 
 // IR2130 Gate Driver pins
 #define HIN1 4
@@ -21,6 +22,10 @@
 // Claw motor control pins (L298N)
 #define CLAW_IN1 13
 #define CLAW_IN2 14
+
+// Serial2 pins for ESP32-S3
+#define RXD2 44
+#define TXD2 43
 
 // Arrays for easy access to pins
 const int RELAY_PINS[5] = {RELAY1, RELAY2, RELAY3, RELAY4, RELAY5};
@@ -47,14 +52,46 @@ QueueHandle_t commandQueue;
 String inputString = "";
 bool stringComplete = false;
 
+// BLE UUIDs
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
 // Function prototypes
 void motorControlTask(void* pvParameters);
 void statusReportTask(void* pvParameters);
 void motorControl(int dir, int vel);
-void controlClaw(bool close);  // Added function prototype
+void controlClaw(bool close);
+void processCommand(String command);
+
+// BLE Characteristic Callback
+class MyCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* pCharacteristic) {
+    std::string value = pCharacteristic->getValue();
+    if (value.length() > 0) {
+      String command = String(value.c_str());
+      for (char c : command) {
+        if (c != '\n' && c != '\r') {
+          inputString += c;
+        }
+        if (c == '\n') {
+          stringComplete = true;
+        }
+      }
+      if (stringComplete) {
+        Serial.println("BLE Command received: " + inputString);
+        processCommand(inputString);
+        inputString = "";
+        stringComplete = false;
+      }
+    }
+  }
+};
 
 void setup() {
+  // Initialize Serial for debugging
   Serial.begin(115200);
+  // Initialize Serial2 on pins 44 (RX) and 43 (TX)
+  Serial2.begin(115200, SERIAL_8N1, RXD2, TXD2);
   inputString.reserve(20);
 
   // Create command queue
@@ -80,6 +117,21 @@ void setup() {
   digitalWrite(CLAW_IN1, LOW);
   digitalWrite(CLAW_IN2, LOW);
 
+  // Initialize BLE
+  NimBLEDevice::init("MotorControlESP32");
+  NimBLEServer* pServer = NimBLEDevice::createServer();
+  NimBLEService* pService = pServer->createService(SERVICE_UUID);
+  NimBLECharacteristic* pCharacteristic = pService->createCharacteristic(
+    CHARACTERISTIC_UUID,
+    NIMBLE_PROPERTY::WRITE
+  );
+  pCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
+  pService->start();
+  NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->start();
+  Serial.println("BLE Advertising Started");
+
   // Create motor control task on core 1
   xTaskCreatePinnedToCore(
     motorControlTask,
@@ -102,13 +154,24 @@ void setup() {
     0    // Run on core 0
   );
 
-  Serial.println("Single Motor Control System Ready");
+  Serial.println("Single Motor Control System with BLE Ready");
 }
 
 void loop() {
-  // Read serial commands
+  // Read serial commands from Serial (USB) for fallback
   while (Serial.available()) {
     char inChar = (char)Serial.read();
+    if (inChar != '\n' && inChar != '\ Johannes\n') {
+      inputString += inChar;
+    }
+    if (inChar == '\n') {
+      stringComplete = true;
+    }
+  }
+
+  // Read serial commands from Serial2 (pins 44, 43)
+  while (Serial2.available()) {
+    char inChar = (char)Serial2.read();
     if (inChar != '\n' && inChar != '\r') {
       inputString += inChar;
     }
@@ -122,15 +185,15 @@ void loop() {
     inputString = "";
     stringComplete = false;
   }
-  
+
   delay(10);
 }
 
-// Process incoming serial commands
+// Process incoming commands (from Serial, Serial2, or BLE)
 void processCommand(String command) {
   command.trim();
   command.toUpperCase();
-  Serial.print("Command received: ");
+  Serial.print("Processing command: ");
   Serial.println(command);
 
   MotorCommand_t cmd;
