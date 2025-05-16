@@ -1,0 +1,472 @@
+#include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <ArduinoBLE.h>
+
+// BLE UART Service UUIDs
+#define SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E" // Nordic UART Service
+#define CHAR_UUID_RX        "6E400002-B5A3-F393-E0A9-E50E24DCCA9E" // Write
+#define CHAR_UUID_TX        "6E400003-B5A3-F393-E0A9-E50E24DCCA9E" // Notify
+
+// Create BLE service and characteristics
+BLEService uartService(SERVICE_UUID);
+BLEStringCharacteristic rxCharacteristic(CHAR_UUID_RX, BLEWrite, 20); // Receive, max 20 bytes
+BLEStringCharacteristic txCharacteristic(CHAR_UUID_TX, BLERead | BLENotify, 50); // Transmit, increased for status
+
+// IR2130 Gate Driver pins
+#define HIN1 4
+#define HIN2 5
+#define HIN3 9
+#define LIN1 10
+#define LIN2 15
+#define LIN3 16
+
+// Relay pins for motor control (Active LOW)
+#define RELAY1 17
+#define RELAY2 18
+#define RELAY3 8
+#define RELAY4 11
+#define RELAY5 12
+
+// Claw motor control pins (L298N)
+#define CLAW_IN1 13
+#define CLAW_IN2 14
+
+// Arrays for easy access to pins
+const int RELAY_PINS[5] = {RELAY1, RELAY2, RELAY3, RELAY4, RELAY5};
+
+// Motor state variables
+volatile int activeMotor = -1;          // Which motor is currently active (-1 = none)
+volatile bool motorRunning = false;     // Is the motor currently running
+volatile int motorDirection = 0;        // 0 = CW, 1 = CCW
+
+// Claw state variable
+volatile bool clawClosed = false;       // Claw state: false = open, true = closed
+
+// Command structure
+typedef struct {
+  int motorNum;    // 1-5 for specific motor, 0 for none
+  bool turnOn;     // true = ON, false = OFF
+  int direction;   // 0 = CW, 1 = CCW, -1 = no change
+} MotorCommand_t;
+
+// FreeRTOS handles
+TaskHandle_t motorTaskHandle = NULL;
+QueueHandle_t commandQueue;
+
+// Function prototypes
+void motorControlTask(void* pvParameters);
+void statusReportTask(void* pvParameters);
+void motorControl(int dir, int vel);
+void controlClaw(bool close);
+void runMotorCycle();
+void processCommand(String command);
+
+void setup() {
+  // Initialize USB Serial for debugging
+  Serial.begin(115200);
+  delay(1000); // Wait for Serial Monitor
+
+  // Initialize BLE
+  if (!BLE.begin()) {
+    Serial.println("Starting BLE failed!");
+    while (1);
+  }
+  
+  // Set BLE device name and advertise service
+  BLE.setLocalName("ESP32_BLE");
+  BLE.setAdvertisedService(uartService);
+  
+  // Add characteristics to service
+  uartService.addCharacteristic(rxCharacteristic);
+  uartService.addCharacteristic(txCharacteristic);
+  
+  // Add service and start advertising
+  BLE.addService(uartService);
+  BLE.advertise();
+  
+  Serial.println("BLE Started! Connect with 'ESP32_BLE'");
+
+  // Create command queue
+  commandQueue = xQueueCreate(5, sizeof(MotorCommand_t));
+
+  // Configure driver pins
+  pinMode(HIN1, OUTPUT); pinMode(HIN2, OUTPUT); pinMode(HIN3, OUTPUT);
+  pinMode(LIN1, OUTPUT); pinMode(LIN2, OUTPUT); pinMode(LIN3, OUTPUT);
+  digitalWrite(HIN1, LOW); digitalWrite(HIN2, LOW); digitalWrite(HIN3, LOW);
+  digitalWrite(LIN1, LOW); digitalWrite(LIN2, LOW); digitalWrite(LIN3, LOW);
+
+  // Configure relay pins (active LOW)
+  for (int i = 0; i < 5; i++) {
+    pinMode(RELAY_PINS[i], OUTPUT);
+    digitalWrite(RELAY_PINS[i], HIGH); // Relays off initially
+  }
+
+  // Configure claw motor control pins
+  pinMode(CLAW_IN1, OUTPUT);
+  pinMode(CLAW_IN2, OUTPUT);
+  digitalWrite(CLAW_IN1, LOW);
+  digitalWrite(CLAW_IN2, LOW);
+
+  // Create motor control task on core 1
+  xTaskCreatePinnedToCore(
+    motorControlTask,
+    "MotorTask",
+    4096,
+    NULL,
+    1,
+    &motorTaskHandle,
+    1    // Run on core 1
+  );
+
+  // Create status reporting task on core 0
+  xTaskCreatePinnedToCore(
+    statusReportTask,
+    "StatusTask",
+    2048,
+    NULL,
+    1,
+    NULL,
+    0    // Run on core 0
+  );
+
+  Serial.println("Single Motor Control System Ready");
+}
+
+void loop() {
+  // Wait for a BLE central device to connect
+  BLEDevice central = BLE.central();
+  
+  if (central) {
+    Serial.print("Connected to: ");
+    Serial.println(central.address());
+    
+    while (central.connected()) {
+      // Check for received BLE data
+      if (rxCharacteristic.written()) {
+        String command = rxCharacteristic.value();
+        Serial.print("BLE Received: ");
+        Serial.println(command);
+        
+        // Process the command
+        processCommand(command);
+        
+        // Send confirmation back to phone
+        String response = "OK: " + command;
+        txCharacteristic.writeValue(response);
+      }
+      
+      delay(20); // Prevent CPU overload
+    }
+    
+    Serial.println("Disconnected");
+  }
+}
+
+// Process incoming commands
+void processCommand(String command) {
+  command.trim();
+  command.toUpperCase();
+  Serial.print("Command received: ");
+  Serial.println(command);
+
+  MotorCommand_t cmd;
+  cmd.turnOn = false;
+  cmd.direction = -1;
+  cmd.motorNum = 0;
+
+  // Check for claw commands
+  if (command == "C1") {
+    controlClaw(true);
+    Serial.println("Claw closing");
+    txCharacteristic.writeValue("Claw closing");
+    return;
+  }
+  if (command == "C0") {
+    controlClaw(false);
+    Serial.println("Claw opening");
+    txCharacteristic.writeValue("Claw opening");
+    return;
+  }
+
+  // Check for motor cycle command
+  if (command == "MALLCYCLE") {
+    runMotorCycle();
+    Serial.println("Starting All motors cycle");
+    txCharacteristic.writeValue("Starting All motors cycle");
+    return;
+  }
+
+  // Check for individual motor commands
+  for (int i = 1; i <= 5; i++) {
+    String motorNum = String(i);
+    
+    if (command == "M" + motorNum + "ON") {
+      cmd.motorNum = i;
+      cmd.turnOn = true;
+      xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+      Serial.println("Motor " + motorNum + " turning ON");
+      txCharacteristic.writeValue("Motor " + motorNum + " turning ON");
+      return;
+    }
+    if (command == "M" + motorNum + "OFF") {
+      cmd.motorNum = i;
+      cmd.turnOn = false;
+      xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+      Serial.println("Motor " + motorNum + " turning OFF");
+      txCharacteristic.writeValue("Motor " + motorNum + " turning OFF");
+      return;
+    }
+    if (command == "M" + motorNum + "0" || command == "M" + motorNum + "CW") {
+      cmd.motorNum = i;
+      cmd.direction = 0;
+      xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+      Serial.println("Motor " + motorNum + " set to Clockwise");
+      txCharacteristic.writeValue("Motor " + motorNum + " set to Clockwise");
+      return;
+    }
+    if (command == "M" + motorNum + "1" || command == "M" + motorNum + "CCW") {
+      cmd.motorNum = i;
+      cmd.direction = 1;
+      xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+      Serial.println("Motor " + motorNum + " set to Counter-Clockwise");
+      txCharacteristic.writeValue("Motor " + motorNum + " set to Counter-Clockwise");
+      return;
+    }
+  }
+
+  if (command == "ALLOFF") {
+    cmd.motorNum = 0;
+    cmd.turnOn = false;
+    xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+    Serial.println("Turning OFF active motor");
+    txCharacteristic.writeValue("Turning OFF active motor");
+    return;
+  }
+
+  Serial.println("Unknown command");
+  txCharacteristic.writeValue("Unknown command");
+}
+
+// Task to handle motor control
+void motorControlTask(void* pvParameters) {
+  MotorCommand_t cmd;
+  const int motorSpeed = 5;
+  
+  while (1) {
+    if (xQueueReceive(commandQueue, &cmd, 0) == pdTRUE) {
+      if (cmd.motorNum == 0) {
+        if (activeMotor >= 0) {
+          digitalWrite(RELAY_PINS[activeMotor], HIGH);
+          activeMotor = -1;
+          motorRunning = false;
+        }
+      } else {
+        int motorIndex = cmd.motorNum - 1;
+        
+        if (activeMotor >= 0 && activeMotor != motorIndex) {
+          digitalWrite(RELAY_PINS[activeMotor], HIGH);
+        }
+        
+        activeMotor = motorIndex;
+        
+        if (cmd.direction >= 0) {
+          motorDirection = cmd.direction;
+        }
+        
+        motorRunning = cmd.turnOn;
+        
+        digitalWrite(RELAY_PINS[motorIndex], motorRunning ? LOW : HIGH);
+      }
+    }
+    
+    if (motorRunning && activeMotor >= 0) {
+      motorControl(motorDirection, motorSpeed);
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+  }
+}
+
+// Motor driving sequence
+void motorControl(int dir, int vel) {
+  int delTime = vel;
+  static int step = 0;
+  
+  if (dir == 0) {
+    switch (step) {
+      case 0: digitalWrite(HIN1, LOW); digitalWrite(LIN1, HIGH); break;
+      case 1: digitalWrite(HIN2, HIGH); digitalWrite(LIN2, LOW); break;
+      case 2: digitalWrite(HIN3, LOW); digitalWrite(LIN3, HIGH); break;
+      case 3: digitalWrite(HIN1, HIGH); digitalWrite(LIN1, LOW); break;
+      case 4: digitalWrite(HIN2, LOW); digitalWrite(LIN2, HIGH); break;
+      case 5: digitalWrite(HIN3, HIGH); digitalWrite(LIN3, LOW); break;
+    }
+  } else {
+    switch (step) {
+      case 0: digitalWrite(HIN1, LOW); digitalWrite(LIN1, HIGH); break;
+      case 1: digitalWrite(HIN3, HIGH); digitalWrite(LIN3, LOW); break;
+      case 2: digitalWrite(HIN2, LOW); digitalWrite(LIN2, HIGH); break;
+      case 3: digitalWrite(HIN1, HIGH); digitalWrite(LIN1, LOW); break;
+      case 4: digitalWrite(HIN3, LOW); digitalWrite(LIN3, HIGH); break;
+      case 5: digitalWrite(HIN2, HIGH); digitalWrite(LIN2, LOW); break;
+    }
+  }
+  
+  step = (step + 1) % 6;
+  vTaskDelay(pdMS_TO_TICKS(delTime));
+}
+
+// Task to periodically report status
+void statusReportTask(void* pvParameters) {
+  while (1) {
+    if (motorRunning && activeMotor >= 0) {
+      String status = String("Motor ") + String(activeMotor + 1) + 
+                     ": Running, Dir: " + (motorDirection == 0 ? "CW" : "CCW");
+      Serial.println(status);
+      txCharacteristic.writeValue(status);
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+// Claw control function
+void controlClaw(bool close) {
+  if (close) {
+    digitalWrite(CLAW_IN1, HIGH);
+    digitalWrite(CLAW_IN2, LOW);
+  } else {
+    digitalWrite(CLAW_IN1, LOW);
+    digitalWrite(CLAW_IN2, HIGH);
+  }
+
+  // Run claw motor for a fixed short time
+  delay(500);  // Adjust if needed
+  digitalWrite(CLAW_IN1, LOW);
+  digitalWrite(CLAW_IN2, LOW);
+
+  clawClosed = close;
+}
+
+// Run motor cycle for all motors
+void runMotorCycle() {
+  while (true) { // Repeat indefinitely
+    // Forward sequence
+    // Motor 1 (M1) for 4 seconds, CW
+    processCommand("M1CW");
+    processCommand("M1ON");
+    Serial.println("Motor 1: Starting Clockwise for 4 seconds");
+    txCharacteristic.writeValue("Motor 1: Starting Clockwise for 4 seconds");
+    vTaskDelay(pdMS_TO_TICKS(4000));
+    processCommand("M1OFF");
+    Serial.println("Motor 1: Turning OFF");
+    txCharacteristic.writeValue("Motor 1: Turning OFF");
+    vTaskDelay(pdMS_TO_TICKS(500)); // Short pause
+
+    // Motor 2 (M2) for 3 seconds, CW
+    processCommand("M2CW");
+    processCommand("M2ON");
+    Serial.println("Motor 2: Starting Clockwise for 3 seconds");
+    txCharacteristic.writeValue("Motor 2: Starting Clockwise for 3 seconds");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    processCommand("M2OFF");
+    Serial.println("Motor 2: Turning OFF");
+    txCharacteristic.writeValue("Motor 2: Turning OFF");
+    vTaskDelay(pdMS_TO_TICKS(500)); // Short pause
+
+    // Motor 3 (M3) for 3 seconds, CW
+    processCommand("M3CW");
+    processCommand("M3ON");
+    Serial.println("Motor 3: Starting Clockwise for 3 seconds");
+    txCharacteristic.writeValue("Motor 3: Starting Clockwise for 3 seconds");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    processCommand("M3OFF");
+    Serial.println("Motor 3: Turning OFF");
+    txCharacteristic.writeValue("Motor 3: Turning OFF");
+    vTaskDelay(pdMS_TO_TICKS(500)); // Short pause
+
+    // Motor 4 (M4) for 1 second, CW
+    processCommand("M4CW");
+    processCommand("M4ON");
+    Serial.println("Motor 4: Starting Clockwise for 1 second");
+    txCharacteristic.writeValue("Motor 4: Starting Clockwise for 1 second");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    processCommand("M4OFF");
+    Serial.println("Motor 4: Turning OFF");
+    txCharacteristic.writeValue("Motor 4: Turning OFF");
+    vTaskDelay(pdMS_TO_TICKS(500)); // Short pause
+
+    // Motor 5 (M5) for 4 seconds, CW
+    processCommand("M5CW");
+    processCommand("M5ON");
+    Serial.println("Motor 5: Starting Clockwise for 4 seconds");
+    txCharacteristic.writeValue("Motor 5: Starting Clockwise for 4 seconds");
+    vTaskDelay(pdMS_TO_TICKS(4000));
+    processCommand("M5OFF");
+    Serial.println("Motor 5: Turning OFF");
+    txCharacteristic.writeValue("Motor 5: Turning OFF");
+    vTaskDelay(pdMS_TO_TICKS(500)); // Short pause
+
+    // Reverse sequence
+    // Motor 5 (M5) for 4 seconds, CCW
+    processCommand("M5CCW");
+    processCommand("M5ON");
+    Serial.println("Motor 5: Starting Counter-Clockwise for 4 seconds");
+    txCharacteristic.writeValue("Motor 5: Starting Counter-Clockwise for 4 seconds");
+    vTaskDelay(pdMS_TO_TICKS(4000));
+    processCommand("M5OFF");
+    Serial.println("Motor 5: Turning OFF");
+    txCharacteristic.writeValue("Motor 5: Turning OFF");
+    vTaskDelay(pdMS_TO_TICKS(500)); // Short pause
+
+    // Motor 4 (M4) for 1 second, CCW
+    processCommand("M4CCW");
+    processCommand("M4ON");
+    Serial.println("Motor 4: Starting Counter-Clockwise for 1 second");
+    txCharacteristic.writeValue("Motor 4: Starting Counter-Clockwise for 1 second");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    processCommand("M4OFF");
+    Serial.println("Motor 4: Turning OFF");
+    txCharacteristic.writeValue("Motor 4: Turning OFF");
+    vTaskDelay(pdMS_TO_TICKS(500)); // Short pause
+
+    // Motor 3 (M3) for 3 seconds, CCW
+    processCommand("M3CCW");
+    processCommand("M3ON");
+    Serial.println("Motor 3: Starting Counter-Clockwise for 3 seconds");
+    txCharacteristic.writeValue("Motor 3: Starting Counter-Clockwise for 3 seconds");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    processCommand("M3OFF");
+    Serial.println("Motor 3: Turning OFF");
+    txCharacteristic.writeValue("Motor 3: Turning OFF");
+    vTaskDelay(pdMS_TO_TICKS(500)); // Short pause
+
+    // Motor 2 (M2) for 3 seconds, CCW
+    processCommand("M2CCW");
+    processCommand("M2ON");
+    Serial.println("Motor 2: Starting Counter-Clockwise for 3 seconds");
+    txCharacteristic.writeValue("Motor 2: Starting Counter-Clockwise for 3 seconds");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    processCommand("M2OFF");
+    Serial.println("Motor 2: Turning OFF");
+    txCharacteristic.writeValue("Motor 2: Turning OFF");
+    vTaskDelay(pdMS_TO_TICKS(500)); // Short pause
+
+    // Motor 1 (M1) for 4 seconds, CCW
+    processCommand("M1CCW");
+    processCommand("M1ON");
+    Serial.println("Motor 1: Starting Counter-Clockwise for 4 seconds");
+    txCharacteristic.writeValue("Motor 1: Starting Counter-Clockwise for 4 seconds");
+    vTaskDelay(pdMS_TO_TICKS(4000));
+    processCommand("M1OFF");
+    Serial.println("Motor 1: Turning OFF");
+    txCharacteristic.writeValue("Motor 1: Turning OFF");
+    vTaskDelay(pdMS_TO_TICKS(500)); // Short pause
+
+    // Pause for 3 seconds before repeating
+    Serial.println("Pausing for 3 seconds before next cycle");
+    txCharacteristic.writeValue("Pausing for 3 seconds before next cycle");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+  }
+}
