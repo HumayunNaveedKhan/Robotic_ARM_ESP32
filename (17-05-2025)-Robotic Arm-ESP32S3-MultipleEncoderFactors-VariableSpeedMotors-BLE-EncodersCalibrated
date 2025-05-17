@@ -59,11 +59,11 @@ volatile int commutationSteps[5] = {0, 0, 0, 0, 0};               // Track each 
 
 // Encoder calibration factors (manually set for each motor)
 const float encoderCalFactors[5] = {
-  1.0, // Motor 1 calibration factor
-  1.0, // Motor 2 calibration factor
-  1.0, // Motor 3 calibration factor
+  0.0220588, // Motor 1 calibration factor
+  0.0065044, // Motor 2 calibration factor
+  0.0039401, // Motor 3 calibration factor
   1.0, // Motor 4 calibration factor
-  1.0  // Motor 5 calibration factor
+  1.0  // Motor 5 calibration f1actor
 };
 
 // Motor speed variables (in milliseconds per commutation step)
