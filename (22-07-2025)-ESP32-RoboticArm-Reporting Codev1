@@ -1,0 +1,731 @@
+#include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
+#include <ArduinoBLE.h>
+
+// BLE UART Service UUIDs
+#define SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E" // Nordic UART Service
+#define CHAR_UUID_RX        "6E400002-B5A3-F393-E0A9-E50E24DCCA9E" // Write
+#define CHAR_UUID_TX        "6E400003-B5A3-F393-E0A9-E50E24DCCA9E" // Notify
+
+// Create BLE service and characteristics
+BLEService uartService(SERVICE_UUID);
+BLEStringCharacteristic rxCharacteristic(CHAR_UUID_RX, BLEWrite | BLEWriteWithoutResponse, 50);
+BLEStringCharacteristic txCharacteristic(CHAR_UUID_TX, BLERead | BLENotify, 100);
+
+// IR2130 Gate Driver pins
+#define HIN1 4
+#define HIN2 5
+#define HIN3 9
+#define LIN1 10
+#define LIN2 15
+#define LIN3 16
+
+// Relay pins for motor control (Active LOW)
+#define RELAY1 17
+#define RELAY2 18
+#define RELAY3 8
+#define RELAY4 11
+#define RELAY5 12
+
+// Claw motor control pins (L298N)
+#define CLAW_IN1 13
+#define CLAW_IN2 14
+
+// Encoder pins
+#define ENC1_A 19
+#define ENC1_B 20
+#define ENC2_A 21
+#define ENC2_B 35
+#define ENC3_A 36
+#define ENC3_B 37
+#define ENC4_A 38
+#define ENC4_B 39
+#define ENC5_A 1
+#define ENC5_B 2
+
+// Arrays for easy access to pins
+const int RELAY_PINS[5] = {RELAY1, RELAY2, RELAY3, RELAY4, RELAY5};
+const int ENC_A_PINS[5] = {ENC1_A, ENC2_A, ENC3_A, ENC4_A, ENC5_A};
+const int ENC_B_PINS[5] = {ENC1_B, ENC2_B, ENC3_B, ENC4_B, ENC5_B};
+
+// Motor state variables
+volatile bool motorStates[5] = {false, false, false, false, false}; // On/off state for each motor
+volatile int motorDirections[5] = {0, 0, 0, 0, 0};                 // Direction for each motor (0=CW, 1=CCW)
+volatile int activeMotors = 0;                                     // Count of active motors
+volatile int commutationSteps[5] = {0, 0, 0, 0, 0};               // Track each motor's commutation step
+volatile long commPulses[5] = {0, 0, 0, 0, 0};                     // Count of commutation pulses (steps)
+
+// Encoder calibration factors (manually set for each motor)
+const float encoderCalFactors[5] = {
+  0.0220588, // Motor 1 calibration factor//300 degrees
+  0.0065044, // Motor 2 calibration factor//120 degrees
+  0.0039401, // Motor 3 calibration factor//260 degrees
+  0.0188608, // Motor 4 calibration factor // 180 degrees
+  0.0189688  // Motor 5 calibration factor// 360 degrees//infinite
+};
+
+// Motor speed variables (in milliseconds per commutation step)
+const int motorSpeeds[5] = {
+  3, // Motor 1 speed (ms per step)
+  5, // Motor 2 speed (ms per step)
+  4, // Motor 3 speed (ms per step)
+  10, // Motor 4 speed (ms per step)
+  3  // Motor 5 speed (ms per step)
+};
+
+// Claw state variable
+volatile bool clawClosed = false;       // Claw state: false = open, true = closed
+
+// Encoder variables
+#define PPR 1000 // Pulses per revolution (adjust for your encoder)
+const float COUNTS_PER_REV = PPR * 4.0; // 4x decoding for quadrature
+const float DEG_PER_COUNT = 360.0 / COUNTS_PER_REV; // Degrees per count
+volatile long encoderCounts[5] = {0, 0, 0, 0, 0}; // Pulse counts for each motor
+float motorAngles[5] = {0.0, 0.0, 0.0, 0.0, 0.0}; // Angles in degrees
+
+// Angle control variables
+volatile int motorModes[5] = {0, 0, 0, 0, 0}; // 0=manual, 1=angle_move, 2=repeat
+volatile float targetAngles[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+volatile float repeatDeltas[5] = {0.0, 0.0, 0.0, 0.0, 0.0}; // Delta for repeat mode
+
+// Command structure
+typedef struct {
+  int motorNum;    // 1-5 for specific motor, 0 for none
+  bool turnOn;     // true = ON, false = OFF
+  int direction;   // 0 = CW, 1 = CCW, -1 = no change
+} MotorCommand_t;
+
+// FreeRTOS handles
+TaskHandle_t motorTaskHandle = NULL;
+TaskHandle_t encoderTaskHandle = NULL;
+QueueHandle_t commandQueue;
+SemaphoreHandle_t motorMutex;
+SemaphoreHandle_t encoderMutex;
+SemaphoreHandle_t bleMutex;
+
+// Serial command handling
+String inputString = "";
+bool stringComplete = false;
+
+// Function prototypes
+void motorControlTask(void* pvParameters);
+void encoderTask(void* pvParameters);
+void commTask(void* pvParameters);
+void motorControl(int motorIdx, int dir);
+void controlClaw(bool close);
+void processCommand(String command);
+void updateBLE(String message);
+void logData(String event);
+
+// Individual interrupt handlers for each encoder
+void IRAM_ATTR handleEncoder1Change() {
+  int a = digitalRead(ENC_A_PINS[0]);
+  int b = digitalRead(ENC_B_PINS[0]);
+  
+  if (a == b) {
+    encoderCounts[0]++; // CW
+  } else {
+    encoderCounts[0]--; // CCW
+  }
+}
+
+void IRAM_ATTR handleEncoder2Change() {
+  int a = digitalRead(ENC_A_PINS[1]);
+  int b = digitalRead(ENC_B_PINS[1]);
+  
+  if (a == b) {
+    encoderCounts[1]++; // CW
+  } else {
+    encoderCounts[1]--; // CCW
+  }
+}
+
+void IRAM_ATTR handleEncoder3Change() {
+  int a = digitalRead(ENC_A_PINS[2]);
+  int b = digitalRead(ENC_B_PINS[2]);
+  
+  if (a == b) {
+    encoderCounts[2]++; // CW
+  } else {
+    encoderCounts[2]--; // CCW
+  }
+}
+
+void IRAM_ATTR handleEncoder4Change() {
+  int a = digitalRead(ENC_A_PINS[3]);
+  int b = digitalRead(ENC_B_PINS[3]);
+  
+  if (a == b) {
+    encoderCounts[3]++; // CW
+  } else {
+    encoderCounts[3]--; // CCW
+  }
+}
+
+void IRAM_ATTR handleEncoder5Change() {
+  int a = digitalRead(ENC_A_PINS[4]);
+  int b = digitalRead(ENC_B_PINS[4]);
+  
+  if (a == b) {
+    encoderCounts[4]++; // CW
+  } else {
+    encoderCounts[4]--; // CCW
+  }
+}
+
+// Setup encoder interrupts
+void setupEncoderInterrupts() {
+  pinMode(ENC_A_PINS[0], INPUT_PULLUP);
+  pinMode(ENC_B_PINS[0], INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_A_PINS[0]), handleEncoder1Change, CHANGE);
+  
+  pinMode(ENC_A_PINS[1], INPUT_PULLUP);
+  pinMode(ENC_B_PINS[1], INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_A_PINS[1]), handleEncoder2Change, CHANGE);
+  
+  pinMode(ENC_A_PINS[2], INPUT_PULLUP);
+  pinMode(ENC_B_PINS[2], INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_A_PINS[2]), handleEncoder3Change, CHANGE);
+  
+  pinMode(ENC_A_PINS[3], INPUT_PULLUP);
+  pinMode(ENC_B_PINS[3], INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_A_PINS[3]), handleEncoder4Change, CHANGE);
+  
+  pinMode(ENC_A_PINS[4], INPUT_PULLUP);
+  pinMode(ENC_B_PINS[4], INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_A_PINS[4]), handleEncoder5Change, CHANGE);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("Booting ESP32-S3...");
+
+  // Print simplified headers
+  Serial.println("Time(ms),Event/Command,ActiveMotor,Degrees,PWM_Pulses,Encoder_Pulses");
+
+  if (!BLE.begin()) {
+    Serial.println("Starting BLE failed!");
+    while (1);
+  }
+  
+  BLE.setLocalName("ESP32_MOTORS");
+  BLE.setAdvertisedService(uartService);
+  uartService.addCharacteristic(rxCharacteristic);
+  uartService.addCharacteristic(txCharacteristic);
+  BLE.addService(uartService);
+  BLE.advertise();
+  Serial.println("BLE Started! Connect with 'ESP32_MOTORS'");
+
+  commandQueue = xQueueCreate(20, sizeof(MotorCommand_t));
+  motorMutex = xSemaphoreCreateMutex();
+  encoderMutex = xSemaphoreCreateMutex();
+  bleMutex = xSemaphoreCreateMutex();
+
+  pinMode(HIN1, OUTPUT); pinMode(HIN2, OUTPUT); pinMode(HIN3, OUTPUT);
+  pinMode(LIN1, OUTPUT); pinMode(LIN2, OUTPUT); pinMode(LIN3, OUTPUT);
+  digitalWrite(HIN1, LOW); digitalWrite(HIN2, LOW); digitalWrite(HIN3, LOW);
+  digitalWrite(LIN1, LOW); digitalWrite(LIN2, LOW); digitalWrite(LIN3, LOW);
+  Serial.println("Gate driver pins initialized LOW");
+
+  for (int i = 0; i < 5; i++) {
+    pinMode(RELAY_PINS[i], OUTPUT);
+    digitalWrite(RELAY_PINS[i], HIGH); // Ensure relays OFF
+    Serial.printf("Relay %d (Pin %d) initialized HIGH (OFF)\n", i + 1, RELAY_PINS[i]);
+  }
+
+  pinMode(CLAW_IN1, OUTPUT);
+  pinMode(CLAW_IN2, OUTPUT);
+  digitalWrite(CLAW_IN1, LOW);
+  digitalWrite(CLAW_IN2, LOW);
+
+  setupEncoderInterrupts();
+  Serial.println("Encoder interrupts initialized");
+
+  xTaskCreatePinnedToCore(
+    motorControlTask,
+    "MotorTask",
+    8192,
+    NULL,
+    2,
+    &motorTaskHandle,
+    0
+  );
+
+  xTaskCreatePinnedToCore(
+    encoderTask,
+    "EncoderTask",
+    4096,
+    NULL,
+    1,
+    &encoderTaskHandle,
+    1
+  );
+
+  xTaskCreatePinnedToCore(
+    commTask,
+    "CommTask",
+    8192,
+    NULL,
+    1,
+    NULL,
+    1
+  );
+
+  Serial.println("Motor Control System Ready");
+  txCharacteristic.writeValue("Motor Control System Ready");
+
+  // Initial log
+  logData("System Ready");
+}
+
+void loop() {
+  while (Serial.available()) {
+    char inChar = (char)Serial.read();
+    if (inChar != '\n' && inChar != '\r') {
+      inputString += inChar;
+    }
+    if (inChar == '\n') {
+      stringComplete = true;
+    }
+  }
+
+  if (stringComplete) {
+    processCommand(inputString);
+    inputString = "";
+    stringComplete = false;
+  }
+  
+  BLEDevice central = BLE.central();
+  
+  if (central) {
+    static bool wasConnected = false;
+    if (!wasConnected) {
+      Serial.print("Connected to: ");
+      Serial.println(central.address());
+      updateBLE("Connected");
+      wasConnected = true;
+    }
+    
+    if (rxCharacteristic.written()) {
+      uint8_t rxBuffer[64];
+      size_t length = rxCharacteristic.readValue(rxBuffer, sizeof(rxBuffer));
+      if (length > 0) {  
+        // Only proceed if data was received
+        String command = "";
+        for (size_t i = 0; i < length; ++i) {
+          // Filter to printable ASCII (32 to 126)
+          if (rxBuffer[i] >= 32 && rxBuffer[i] <= 126) {
+            command += char(rxBuffer[i]);
+          }
+        }
+        command.trim();
+        command.toUpperCase();
+        if (command.length() > 0) {
+          Serial.print("Cleaned BLE command: ");
+          Serial.println(command);
+          processCommand(command);
+        }
+      }
+    }
+  } else {
+    static bool wasConnected = false;
+    if (wasConnected) {
+      Serial.println("Disconnected");
+      wasConnected = false;
+    }
+  }
+  
+  delay(10);
+}
+
+void processCommand(String command) {
+  command.trim();
+  command.toUpperCase();
+  Serial.print("Command received: ");
+  Serial.println(command);
+
+  MotorCommand_t cmd;
+  cmd.turnOn = false;
+  cmd.direction = -1;
+  cmd.motorNum = 0;
+
+  bool handled = false;
+
+  if (command == "C1") {
+    controlClaw(true);
+    updateBLE("Claw closing");
+    handled = true;
+  } else if (command == "C0") {
+    controlClaw(false);
+    updateBLE("Claw opening");
+    handled = true;
+  } else if (command == "TESTRELAYS") {
+    Serial.println("Testing relays...");
+    updateBLE("Testing relays...");
+    for (int i = 0; i < 5; i++) {
+      digitalWrite(RELAY_PINS[i], LOW);
+      delay(1000);
+      digitalWrite(RELAY_PINS[i], HIGH);
+      delay(500);
+    }
+    updateBLE("Relay test complete");
+    handled = true;
+  } else if (command == "ALLOFF") {
+    for (int i = 1; i <= 5; i++) {
+      cmd.motorNum = i;
+      cmd.turnOn = false;
+      xQueueSend(commandQueue, &cmd, 0);
+    }
+    updateBLE("All motors OFF");
+    handled = true;
+  } else if (command == "ALLCW") {
+    for (int i = 1; i <= 5; i++) {
+      cmd.motorNum = i;
+      cmd.direction = 0;
+      xQueueSend(commandQueue, &cmd, 0);
+    }
+    updateBLE("All motors set to CW");
+    handled = true;
+  } else if (command == "ALLCCW") {
+    for (int i = 1; i <= 5; i++) {
+      cmd.motorNum = i;
+      cmd.direction = 1;
+      xQueueSend(commandQueue, &cmd, 0);
+    }
+    updateBLE("All motors set to CCW");
+    handled = true;
+  } else if (command == "RESET") {
+    ESP.restart();
+    return;
+  }
+
+  // Handle per-motor commands
+  for (int i = 1; i <= 5; i++) {
+    String motorNum = String(i);
+    String prefix = "M" + motorNum;
+
+    if (command.startsWith(prefix)) {
+      String suffix = command.substring(prefix.length());
+
+      if (suffix == "ON") {
+        cmd.motorNum = i;
+        cmd.turnOn = true;
+        xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+        updateBLE("Motor " + motorNum + " turning ON");
+        handled = true;
+      } else if (suffix == "OFF") {
+        cmd.motorNum = i;
+        cmd.turnOn = false;
+        xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+        updateBLE("Motor " + motorNum + " turning OFF");
+        handled = true;
+      } else if (suffix == "0" || suffix == "CW") {
+        cmd.motorNum = i;
+        cmd.direction = 0;
+        xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+        updateBLE("Motor " + motorNum + " set to Clockwise");
+        handled = true;
+      } else if (suffix == "1" || suffix == "CCW") {
+        cmd.motorNum = i;
+        cmd.direction = 1;
+        xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+        updateBLE("Motor " + motorNum + " set to Counter-Clockwise");
+        handled = true;
+      } else if (suffix.startsWith("CW") || suffix.startsWith("CCW")) {
+        bool isCW = suffix.startsWith("CW");
+        String angleStr = suffix.substring(2);
+        bool isRepeat = false;
+        if (angleStr.endsWith("R")) {
+          isRepeat = true;
+          angleStr = angleStr.substring(0, angleStr.length() - 1);
+        }
+        float angle = angleStr.toFloat();
+        if (angle > 0) {
+          xSemaphoreTake(motorMutex, portMAX_DELAY);
+          xSemaphoreTake(encoderMutex, portMAX_DELAY);
+          int motorIdx = i - 1;
+          float currentAngle = motorAngles[motorIdx];
+          float delta = isCW ? -angle : angle;  // Adjusted sign based on observed behavior (CW decreases angle)
+          targetAngles[motorIdx] = currentAngle + delta;
+          repeatDeltas[motorIdx] = delta;
+          motorDirections[motorIdx] = isCW ? 0 : 1;
+          motorStates[motorIdx] = true;
+          digitalWrite(RELAY_PINS[motorIdx], LOW);
+          activeMotors++;
+          motorModes[motorIdx] = isRepeat ? 2 : 1;
+          xSemaphoreGive(encoderMutex);
+          xSemaphoreGive(motorMutex);
+          updateBLE("Motor " + motorNum + (isCW ? " CW " : " CCW ") + String(angle) + (isRepeat ? " repeat" : ""));
+          handled = true;
+        }
+      }
+    }
+  }
+
+  if (!handled) {
+    updateBLE("Unknown command");
+  }
+
+  // Log the command
+  logData("Command: " + command);
+}
+
+void motorControlTask(void* pvParameters) {
+  MotorCommand_t cmd;
+  
+  while (1) {
+    if (xQueueReceive(commandQueue, &cmd, 0) == pdTRUE) {
+      int motorIndex = cmd.motorNum - 1;
+      
+      if (motorIndex >= 0 && motorIndex < 5) {
+        xSemaphoreTake(motorMutex, portMAX_DELAY);
+        
+        if (cmd.direction >= 0) {
+          motorDirections[motorIndex] = cmd.direction;
+          Serial.printf("Motor %d direction set to %s\n", 
+                     motorIndex + 1, motorDirections[motorIndex] == 0 ? "CW" : "CCW");
+        }
+        
+        bool wasRunning = motorStates[motorIndex];
+        motorStates[motorIndex] = cmd.turnOn;
+        
+        digitalWrite(RELAY_PINS[motorIndex], motorStates[motorIndex] ? LOW : HIGH);
+        
+        if (motorStates[motorIndex] && !wasRunning) {
+          activeMotors++;
+        } else if (!motorStates[motorIndex] && wasRunning) {
+          activeMotors--;
+          // Turn off all gate driver signals when motor is stopped
+          digitalWrite(HIN1, LOW); digitalWrite(HIN2, LOW); digitalWrite(HIN3, LOW);
+          digitalWrite(LIN1, LOW); digitalWrite(LIN2, LOW); digitalWrite(LIN3, LOW);
+          // Reset mode on off
+          motorModes[motorIndex] = 0;
+        }
+        
+        xSemaphoreGive(motorMutex);
+      }
+    }
+    
+    xSemaphoreTake(motorMutex, portMAX_DELAY);
+    xSemaphoreTake(encoderMutex, portMAX_DELAY);
+    for (int i = 0; i < 5; i++) {
+      if (motorStates[i]) {
+        motorControl(i, motorDirections[i]);
+        // Check if reached target
+        if (motorModes[i] >= 1) {
+          bool reached = false;
+          // Adjusted based on observed direction (CW decreases angle)
+          if (motorDirections[i] == 0) {  // CW: decreasing
+            if (motorAngles[i] <= targetAngles[i]) reached = true;
+          } else {  // CCW: increasing
+            if (motorAngles[i] >= targetAngles[i]) reached = true;
+          }
+          if (reached) {
+            String msg = "Motor " + String(i + 1) + " reached target " + String(motorAngles[i], 3) + "°";
+            Serial.println(msg);
+            updateBLE(msg);
+            if (motorModes[i] == 1) {
+              // Stop for single move
+              motorStates[i] = false;
+              digitalWrite(RELAY_PINS[i], HIGH);
+              activeMotors--;
+              motorModes[i] = 0;
+              // Turn off gate drivers
+              digitalWrite(HIN1, LOW); digitalWrite(HIN2, LOW); digitalWrite(HIN3, LOW);
+              digitalWrite(LIN1, LOW); digitalWrite(LIN2, LOW); digitalWrite(LIN3, LOW);
+            } else if (motorModes[i] == 2) {
+              // Reverse for repeat
+              motorDirections[i] = 1 - motorDirections[i];
+              repeatDeltas[i] = -repeatDeltas[i];
+              targetAngles[i] = motorAngles[i] + repeatDeltas[i];
+            }
+            logData("Reached: M" + String(i + 1));
+          }
+        }
+        vTaskDelay(pdMS_TO_TICKS(motorSpeeds[i])); // Use individual motor speed
+      }
+    }
+    xSemaphoreGive(encoderMutex);
+    xSemaphoreGive(motorMutex);
+    
+    vTaskDelay(pdMS_TO_TICKS(1)); // Minimal delay to prevent task starvation
+  }
+}
+
+void motorControl(int motorIdx, int dir) {
+  // Six-step commutation sequence for BLDC motor with IR2130
+  // Each step energizes two phases: one high-side and one low-side
+  int step = commutationSteps[motorIdx];
+  
+  // Initialize all gate driver inputs to LOW
+  bool h1 = LOW, h2 = LOW, h3 = LOW, l1 = LOW, l2 = LOW, l3 = LOW;
+  
+  // Dead time in microseconds to prevent shoot-through
+  const int deadTime = 2; // 2µs, adjust based on IR2130 datasheet and motor
+  
+  // Define commutation sequence (CW and CCW)
+  if (dir == 0) { // Clockwise
+    switch (step) {
+      case 0: h1 = HIGH; l2 = HIGH; break; // Phase A high, Phase B low
+      case 1: h1 = HIGH; l3 = HIGH; break; // Phase A high, Phase C low
+      case 2: h2 = HIGH; l3 = HIGH; break; // Phase B high, Phase C low
+      case 3: h2 = HIGH; l1 = HIGH; break; // Phase B high, Phase A low
+      case 4: h3 = HIGH; l1 = HIGH; break; // Phase C high, Phase A low
+      case 5: h3 = HIGH; l2 = HIGH; break; // Phase C high, Phase B low
+    }
+  } else { // Counter-clockwise
+    switch (step) {
+      case 0: h3 = HIGH; l2 = HIGH; break; // Phase C high, Phase B low
+      case 1: h3 = HIGH; l1 = HIGH; break; // Phase C high, Phase A low
+      case 2: h2 = HIGH; l1 = HIGH; break; // Phase B high, Phase A low
+      case 3: h2 = HIGH; l3 = HIGH; break; // Phase B high, Phase C low
+      case 4: h1 = HIGH; l3 = HIGH; break; // Phase A high, Phase C low
+      case 5: h1 = HIGH; l2 = HIGH; break; // Phase A high, Phase B low
+    }
+  }
+  
+  // Apply signals only if motor is active
+  if (motorStates[motorIdx]) {
+    // Turn off all signals first to ensure dead time
+    digitalWrite(HIN1, LOW); digitalWrite(HIN2, LOW); digitalWrite(HIN3, LOW);
+    digitalWrite(LIN1, LOW); digitalWrite(LIN2, LOW); digitalWrite(LIN3, LOW);
+    delayMicroseconds(deadTime);
+    
+    // Apply new signals
+    digitalWrite(HIN1, h1); digitalWrite(HIN2, h2); digitalWrite(HIN3, h3);
+    digitalWrite(LIN1, l1); digitalWrite(LIN2, l2); digitalWrite(LIN3, l3);
+  }
+  
+  // Increment step and pulse count for next commutation
+  commutationSteps[motorIdx] = (commutationSteps[motorIdx] + 1) % 6;
+  commPulses[motorIdx]++;
+}
+
+void encoderTask(void* pvParameters) {
+  TickType_t lastWakeTime = xTaskGetTickCount();
+  
+  while (1) {
+    xSemaphoreTake(encoderMutex, portMAX_DELAY);
+    for (int i = 0; i < 5; i++) {
+      // Apply calibration factor to encoder counts
+      float calibratedCounts = encoderCounts[i] * encoderCalFactors[i];
+      motorAngles[i] = calibratedCounts * DEG_PER_COUNT;
+    }
+    xSemaphoreGive(encoderMutex);
+    
+    String angleReport = "Angles:";
+    bool hasActive = false;
+    
+    for (int i = 0; i < 5; i++) {
+      if (motorStates[i]) {
+        angleReport += " M" + String(i + 1) + ":" + String(motorAngles[i], 3) + "°";
+        hasActive = true;
+      }
+    }
+    
+    if (hasActive) {
+      updateBLE(angleReport);
+      logData("Update");
+    }
+    
+    vTaskDelayUntil(&lastWakeTime, pdMS_TO_TICKS(100));  // 100ms interval
+  }
+}
+
+void commTask(void* pvParameters) {
+  TickType_t lastStatusTime = xTaskGetTickCount();
+  
+  while (1) {
+    if (xTaskGetTickCount() - lastStatusTime >= pdMS_TO_TICKS(2000)) {
+      String status = "Status:";
+      bool hasActive = false;
+      
+      xSemaphoreTake(motorMutex, portMAX_DELAY);
+      for (int i = 0; i < 5; i++) {
+        if (motorStates[i]) {
+          status += " M" + String(i + 1) + ":" + (motorDirections[i] == 0 ? "CW" : "CCW");
+          hasActive = true;
+        }
+      }
+      xSemaphoreGive(motorMutex);
+      
+      if (hasActive) {
+        updateBLE(status);
+      }
+      
+      lastStatusTime = xTaskGetTickCount();
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+void updateBLE(String message) {
+  xSemaphoreTake(bleMutex, portMAX_DELAY);
+  
+  if (BLE.connected() && txCharacteristic.subscribed()) {
+    txCharacteristic.writeValue(message);
+  }
+  
+  xSemaphoreGive(bleMutex);
+  
+  // Removed Serial.println(message) to keep serial output clean
+}
+
+void controlClaw(bool close) {
+  if (close) {
+    digitalWrite(CLAW_IN1, HIGH);
+    digitalWrite(CLAW_IN2, LOW);
+  } else {
+    digitalWrite(CLAW_IN1, LOW);
+    digitalWrite(CLAW_IN2, HIGH);
+  }
+  
+  delay(500);
+  
+  digitalWrite(CLAW_IN1, LOW);
+  digitalWrite(CLAW_IN2, LOW);
+  
+  clawClosed = close;
+  Serial.printf("Claw %s\n", close ? "closed" : "opened");
+  logData("Claw " + String(close ? "closed" : "opened"));
+}
+
+void logData(String event) {
+  xSemaphoreTake(motorMutex, portMAX_DELAY);
+  xSemaphoreTake(encoderMutex, portMAX_DELAY);
+
+  bool hasActive = false;
+  for (int i = 0; i < 5; i++) {
+    if (motorStates[i]) {
+      hasActive = true;
+      Serial.print(millis());
+      Serial.print(",");
+      Serial.print(event);
+      Serial.print(",");
+      Serial.print("M" + String(i + 1));
+      Serial.print(",");
+      Serial.print(motorAngles[i], 3);  // Degrees with 3 decimal places
+      Serial.print(",");
+      Serial.print(commPulses[i]);  // PWM pulses (commPulses)
+      Serial.print(",");
+
+      Serial.println(encoderCounts[i]);  // Encoder pulses
+    }
+  }
+
+  if (!hasActive && event.startsWith("Command:") || event.startsWith("Reached:") || event.startsWith("Claw")) {
+    // For non-update events without active motors, print the event
+    Serial.print(millis());
+    Serial.print(",");
+    Serial.print(event);
+    Serial.println(",NoActiveMotor,,,");
+  }
+
+  xSemaphoreGive(encoderMutex);
+  xSemaphoreGive(motorMutex);
+}
