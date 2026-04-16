@@ -1,0 +1,176 @@
+"""
+IK Controller for indigenously developed BLDC robotic arm
+Communicates via existing Serial protocol on ESP32-S3
+Assumes 5-DOF arm using Denavit-Hartenberg parameters
+"""
+
+import serial
+import time
+import numpy as np
+import roboticstoolbox as rtb
+from spatialmath import SE3
+
+# ─────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────
+
+PORT     = 'COM3'
+BAUD     = 115200
+MOTORS   = 5
+
+DH_PARAMS = [
+    [0.100,  0.000,  np.pi/2],
+    [0.000,  0.350,  0.000  ],
+    [0.000,  0.300,  0.000  ],
+    [0.000,  0.000,  np.pi/2],
+    [0.080,  0.000,  0.000  ],
+]
+
+MOTOR_DIR_SIGN = [1, 1, 1, 1, 1]
+DEAD_BAND_DEG  = 1.0
+
+SEC_PER_DEG = [0.012, 0.020, 0.016, 0.040, 0.012]
+
+# ─────────────────────────────────────────────
+# IK SOLVER
+# ─────────────────────────────────────────────
+
+def build_robot():
+    links = []
+    for d, a, alpha in DH_PARAMS:
+        links.append(rtb.RevoluteDH(d=d, a=a, alpha=alpha))
+    return rtb.DHRobot(links, name="IndigenousArm")
+
+def solve_ik(robot, x, y, z, current_q=None):
+    T = SE3(x, y, z)
+    sol = robot.ikine_LM(T, q0=current_q) if current_q is not None else robot.ikine_LM(T)
+
+    if not sol.success:
+        print(f"[IK] No solution for ({x:.3f}, {y:.3f}, {z:.3f})")
+        return None
+
+    return np.degrees(sol.q).tolist(), sol.q
+
+# ─────────────────────────────────────────────
+# ESP32 CONTROLLER
+# ─────────────────────────────────────────────
+
+class ESP32Controller:
+
+    def __init__(self, port=PORT, baud=BAUD):
+        print(f"Connecting to ESP32-S3 on {port}...")
+        self.ser = serial.Serial(port, baud, timeout=1)
+        time.sleep(2)
+        self._flush_boot_messages()
+
+        self.current_angles_deg = [0.0] * MOTORS
+        self.current_q_rad      = None
+        self.robot              = build_robot()
+
+        print("ESP32 controller ready.\n")
+
+    def _flush_boot_messages(self):
+        time.sleep(0.3)
+        while self.ser.in_waiting:
+            line = self.ser.readline().decode(errors='ignore').strip()
+            if line:
+                print(f"[ESP32 boot] {line}")
+
+    def _send(self, cmd):
+        self.ser.write((cmd + '\n').encode())
+        print(f">>> {cmd}")
+
+    def _wait_for_token(self, token):
+        """Block until the exact token is received from the serial stream."""
+        while True:
+            line = self.ser.readline().decode("utf-8", errors="ignore").strip()
+            if line:
+                print(f"[ESP32] {line}")
+            if line == token:
+                return True
+
+    def stop(self):
+        self._send("STOP")
+
+    # ─────────────────────────────────────────
+    # MOTOR MOVE
+    # ─────────────────────────────────────────
+
+    def move_motor(self, motor_idx, delta_deg):
+
+        if abs(delta_deg) < DEAD_BAND_DEG:
+            print(f"[M{motor_idx+1}] {delta_deg:.2f}° below deadband — skip")
+            return True                              # ← inside if
+
+        signed = delta_deg * MOTOR_DIR_SIGN[motor_idx]
+        direction = "CW" if signed > 0 else "CCW"
+        magnitude_int = int(round(abs(signed)))
+
+        if magnitude_int == 0:
+            print(f"[M{motor_idx+1}] rounded to 0 — skip")
+            return True                              # ← inside if
+
+        cmd = f"M{motor_idx + 1}{direction}{magnitude_int}"
+        self._send(cmd)
+
+        done_token = f"M{motor_idx + 1}_DONE"
+        success = self._wait_for_token(done_token)
+
+        if not success:
+            print(f"[ERROR] M{motor_idx+1} failed (no DONE)")
+            return False
+
+        # Update tracking only after success
+        self.current_angles_deg[motor_idx] += (
+            magnitude_int if signed > 0 else -magnitude_int
+        )
+
+        time.sleep(0.05)
+        return True
+
+    # ─────────────────────────────────────────
+    # IK MOVE
+    # ─────────────────────────────────────────
+
+    def move_to(self, x, y, z):
+        print(f"\nIK target: x={x:.3f}, y={y:.3f}, z={z:.3f}")
+
+        result = solve_ik(self.robot, x, y, z, self.current_q_rad)
+        if result is None:
+            return False
+
+        target_deg, target_rad = result
+        print(f"IK solution (deg): {[round(a,2) for a in target_deg]}")
+
+        for i in range(MOTORS):
+            delta = target_deg[i] - self.current_angles_deg[i]
+            print(f"  Motor {i+1} delta: {delta:.2f}")
+
+            ok = self.move_motor(i, delta)
+            if not ok:
+                print(f"[WARN] Motor {i+1} failed — continuing")
+
+        self.current_q_rad = target_rad.tolist()
+        print(f"Current angles: {[round(a,2) for a in self.current_angles_deg]}\n")
+        return True
+
+    def close(self):
+        self.ser.close()
+        print("Serial port closed.")
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    arm = ESP32Controller(port=PORT)
+
+    try:
+        arm.move_to(0.2, 0.2, 0.2)
+
+    except KeyboardInterrupt:
+        print("\nInterrupted — sending STOP")
+        arm.stop()
+
+    finally:
+        arm.close()
