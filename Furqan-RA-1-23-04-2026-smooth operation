@@ -1,0 +1,394 @@
+#include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+#include <math.h>
+
+/* =========================================================
+   PIN DEFINITIONS
+   ========================================================= */
+#define HIN1 4
+#define HIN2 5
+#define HIN3 9
+#define LIN1 10
+#define LIN2 15
+#define LIN3 16
+
+#define RELAY1 17
+#define RELAY2 18
+#define RELAY3 8
+#define RELAY4 11
+#define RELAY5 12
+
+#define ENC1_A 19
+#define ENC1_B 20
+#define ENC2_A 21
+#define ENC2_B 35
+#define ENC3_A 36
+#define ENC3_B 37
+#define ENC4_A 38
+#define ENC4_B 39
+#define ENC5_A 1
+#define ENC5_B 2
+
+const int RELAY_PINS[5] = {RELAY1, RELAY2, RELAY3, RELAY4, RELAY5};
+const int ENC_A[5]      = {ENC1_A, ENC2_A, ENC3_A, ENC4_A, ENC5_A};
+const int ENC_B[5]      = {ENC1_B, ENC2_B, ENC3_B, ENC4_B, ENC5_B};
+
+/* =========================================================
+   MOTOR STATE
+   ========================================================= */
+volatile bool motorRun[5]  = {0};
+volatile int  motorDir[5]  = {0};
+volatile int  motorMode[5] = {0};
+volatile int  commStep[5]  = {0};
+
+volatile long encoderCnt[5] = {0};
+float motorAngle[5] = {0};
+
+/* FIX: encoderDir is now applied in the ISRs directly via
+        signed increment, not in the encoder task.
+        Set -1 to reverse a specific motor's count direction. */
+const int encoderDir[5] = {1, 1, 1, 1, 1};
+
+const float encoderCal[5] = {
+  0.041f,
+  0.0333f,
+  0.05f,
+  0.1f,
+  0.0277777777777778f
+};
+
+const int motorSpeed[5] = {3, 5, 4, 10, 3};
+
+/* =========================================================
+   STOP LOGIC
+   ========================================================= */
+const float ANGLE_TOL_DEG = 0.8f;
+
+float moveStartAngle[5] = {0};
+float moveDeltaDeg[5]   = {0};
+bool  moveActive[5]     = {false};
+
+/* =========================================================
+   FIX: Spinlock for atomic commutation on dual-core ESP32.
+        taskENTER_CRITICAL alone only suspends the calling
+        core — portMUX_TYPE locks both cores, preventing
+        encoder ISRs on Core 1 from racing the GPIO writes.
+   ========================================================= */
+static portMUX_TYPE commMux = portMUX_INITIALIZER_UNLOCKED;
+
+/* =========================================================
+   RTOS
+   ========================================================= */
+SemaphoreHandle_t motorMutex;
+SemaphoreHandle_t encMutex;
+
+/* =========================================================
+   SERIAL INPUT
+   ========================================================= */
+String inputString;
+bool stringComplete = false;
+
+/* ========================================================= */
+void motorTask(void *);
+void encoderTask(void *);
+void motorCommutate(int, int);
+
+static inline void allMotorsOff_NoMutex() {
+  for (int i = 0; i < 5; i++) {
+    motorRun[i]   = false;
+    motorMode[i]  = 0;
+    moveActive[i] = false;
+    digitalWrite(RELAY_PINS[i], HIGH);
+  }
+}
+
+static inline void stopEverything() {
+  xSemaphoreTake(motorMutex, portMAX_DELAY);
+  xSemaphoreTake(encMutex,   portMAX_DELAY);
+  allMotorsOff_NoMutex();
+  xSemaphoreGive(encMutex);
+  xSemaphoreGive(motorMutex);
+  Serial.println("STOPPED");
+}
+
+/* =========================================================
+   MOVE FUNCTION
+   ========================================================= */
+static inline void queueMove(uint8_t m, uint8_t dir, float deltaDeg) {
+  allMotorsOff_NoMutex();
+
+  motorDir[m]  = dir;
+  motorMode[m] = 1;
+  motorRun[m]  = true;
+
+  moveStartAngle[m] = motorAngle[m];
+  moveDeltaDeg[m]   = fabsf(deltaDeg);
+  moveActive[m]     = true;
+
+  digitalWrite(RELAY_PINS[m], LOW);
+}
+
+/* =========================================================
+   ENCODER ISRs
+   FIX: encoderDir[] is now consulted here so the count
+        direction is applied at the source. The encoder task
+        no longer multiplies by encoderDir (it was already
+        baked in), preventing double-inversion.
+   ========================================================= */
+void IRAM_ATTR encISR0() {
+  int delta = (digitalRead(ENC_A[0]) == digitalRead(ENC_B[0])) ? 1 : -1;
+  encoderCnt[0] += delta * encoderDir[0];
+}
+void IRAM_ATTR encISR1() {
+  int delta = (digitalRead(ENC_A[1]) == digitalRead(ENC_B[1])) ? 1 : -1;
+  encoderCnt[1] += delta * encoderDir[1];
+}
+void IRAM_ATTR encISR2() {
+  int delta = (digitalRead(ENC_A[2]) == digitalRead(ENC_B[2])) ? 1 : -1;
+  encoderCnt[2] += delta * encoderDir[2];
+}
+void IRAM_ATTR encISR3() {
+  int delta = (digitalRead(ENC_A[3]) == digitalRead(ENC_B[3])) ? 1 : -1;
+  encoderCnt[3] += delta * encoderDir[3];
+}
+void IRAM_ATTR encISR4() {
+  int delta = (digitalRead(ENC_A[4]) == digitalRead(ENC_B[4])) ? 1 : -1;
+  encoderCnt[4] += delta * encoderDir[4];
+}
+
+void setupEncoders() {
+  for (int i = 0; i < 5; i++) {
+    pinMode(ENC_A[i], INPUT_PULLUP);
+    pinMode(ENC_B[i], INPUT_PULLUP);
+  }
+  attachInterrupt(ENC_A[0], encISR0, CHANGE);
+  attachInterrupt(ENC_A[1], encISR1, CHANGE);
+  attachInterrupt(ENC_A[2], encISR2, CHANGE);
+  attachInterrupt(ENC_A[3], encISR3, CHANGE);
+  attachInterrupt(ENC_A[4], encISR4, CHANGE);
+}
+
+/* =========================================================
+   SETUP
+   ========================================================= */
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(HIN1, OUTPUT); pinMode(HIN2, OUTPUT); pinMode(HIN3, OUTPUT);
+  pinMode(LIN1, OUTPUT); pinMode(LIN2, OUTPUT); pinMode(LIN3, OUTPUT);
+
+  // Start with all gate signals LOW (safe state)
+  digitalWrite(HIN1, LOW); digitalWrite(HIN2, LOW); digitalWrite(HIN3, LOW);
+  digitalWrite(LIN1, LOW); digitalWrite(LIN2, LOW); digitalWrite(LIN3, LOW);
+
+  for (int i = 0; i < 5; i++) {
+    pinMode(RELAY_PINS[i], OUTPUT);
+    digitalWrite(RELAY_PINS[i], HIGH); // Relays open (motors disconnected)
+  }
+
+  setupEncoders();
+
+  motorMutex = xSemaphoreCreateMutex();
+  encMutex   = xSemaphoreCreateMutex();
+
+  xTaskCreatePinnedToCore(motorTask,   "Motor",   8192, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(encoderTask, "Encoder", 4096, NULL, 1, NULL, 1);
+
+  Serial.println("Ready");
+  Serial.println("Commands:");
+  Serial.println("  STOP");
+  Serial.println("  MxON / MxOFF          (x = 1..5)");
+  Serial.println("  MxCW<deg> / MxCCW<deg>");
+}
+
+/* =========================================================
+   LOOP  (serial command parser)
+   ========================================================= */
+void loop() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n') stringComplete = true;
+    else if (c != '\r') inputString += c;
+  }
+
+  if (!stringComplete) return;
+
+  inputString.trim();
+  inputString.toUpperCase();
+
+  if (inputString == "STOP") {
+    stopEverything();
+  }
+  else if (inputString.startsWith("M")) {
+    int m = inputString.substring(1, 2).toInt() - 1;
+    if (m < 0 || m > 4) {
+      Serial.println("ERR: motor index must be 1..5");
+      goto done;
+    }
+
+    if (inputString.endsWith("ON")) {
+      xSemaphoreTake(motorMutex, portMAX_DELAY);
+      motorRun[m]  = true;
+      motorMode[m] = 0;
+      digitalWrite(RELAY_PINS[m], LOW);
+      xSemaphoreGive(motorMutex);
+    }
+    else if (inputString.endsWith("OFF")) {
+      xSemaphoreTake(motorMutex, portMAX_DELAY);
+      motorRun[m]  = false;
+      motorMode[m] = 0;
+      digitalWrite(RELAY_PINS[m], HIGH);
+      xSemaphoreGive(motorMutex);
+    }
+    else {
+      int idxCCW = inputString.indexOf("CCW");
+      int idxCW  = inputString.indexOf("CW");
+
+      bool hasCCW = (idxCCW >= 0);
+      bool hasCW  = (!hasCCW && idxCW >= 0);
+
+      if (!(hasCW || hasCCW)) {
+        Serial.println("ERR: unrecognised command");
+        goto done;
+      }
+
+      float angle = hasCCW
+        ? inputString.substring(idxCCW + 3).toFloat()
+        : inputString.substring(idxCW  + 2).toFloat();
+
+      angle = fabsf(angle);
+      if (angle == 0.0f) {
+        Serial.println("ERR: angle must be > 0");
+        goto done;
+      }
+
+      uint8_t dir = hasCW ? 1 : 0;
+
+      xSemaphoreTake(motorMutex, portMAX_DELAY);
+      xSemaphoreTake(encMutex,   portMAX_DELAY);
+      queueMove(m, dir, angle);
+      xSemaphoreGive(encMutex);
+      xSemaphoreGive(motorMutex);
+    }
+  }
+  else {
+    Serial.println("ERR: unknown command");
+  }
+
+done:
+  inputString      = "";
+  stringComplete   = false;
+}
+
+/* =========================================================
+   MOTOR TASK
+   ========================================================= */
+void motorTask(void *) {
+  TickType_t lastStep[5] = {0, 0, 0, 0, 0};
+
+  while (1) {
+    TickType_t now = xTaskGetTickCount();
+
+    for (int i = 0; i < 5; i++) {
+      if ((now - lastStep[i]) < pdMS_TO_TICKS(motorSpeed[i])) continue;
+
+      /* FIX: Always update lastStep[], even when motor is stopped.
+              Previously the timestamp was only written inside
+              if(motorRun[i]), so a stopped motor would fire immediately
+              on every subsequent tick — burning CPU and potentially
+              re-triggering commutation. */
+      lastStep[i] = now;
+
+      xSemaphoreTake(motorMutex, portMAX_DELAY);
+      xSemaphoreTake(encMutex,   portMAX_DELAY);
+
+      if (motorRun[i]) {
+        if (motorMode[i] && moveActive[i]) {
+          float moved = fabsf(motorAngle[i] - moveStartAngle[i]);
+          if (moved + ANGLE_TOL_DEG >= moveDeltaDeg[i]) {
+            // Target reached — stop motor and open relay
+            motorRun[i]   = false;
+            motorMode[i]  = 0;
+            moveActive[i] = false;
+            digitalWrite(RELAY_PINS[i], HIGH);
+            Serial.printf("M%d_DONE\n", i + 1);
+          } else {
+            motorCommutate(i, motorDir[i]);
+          }
+        } else {
+          motorCommutate(i, motorDir[i]);
+        }
+      }
+
+      xSemaphoreGive(encMutex);
+      xSemaphoreGive(motorMutex);
+    }
+
+    vTaskDelay(1);
+  }
+}
+
+/* =========================================================
+   COMMUTATION
+   FIX 1: commStep[] is advanced BEFORE entering the critical
+           section — no hardware access needed for the math.
+   FIX 2: taskENTER_CRITICAL / taskEXIT_CRITICAL with a
+           portMUX_TYPE spinlock makes the dead-time window
+           and pin-set sequence fully atomic on both ESP32
+           cores. A plain vTaskDelay / delayMicroseconds
+           inside a FreeRTOS task is still preemptable by
+           the scheduler; the spinlock prevents that.
+   FIX 3: HIN and LIN for the new step are written in a
+           single switch block that is entirely inside the
+           critical section, eliminating the brief window
+           where HIN is HIGH but LIN is not yet set.
+   ========================================================= */
+void motorCommutate(int i, int dir) {
+  // Advance step index — pure arithmetic, no GPIO needed
+  int s = commStep[i];
+  if (dir == 0) commStep[i] = (s + 1) % 6;
+  else          commStep[i] = (s + 5) % 6;
+
+  // --- Begin atomic section (both cores locked) ---
+  taskENTER_CRITICAL(&commMux);
+
+  // All gate signals LOW (blanking)
+  digitalWrite(HIN1, LOW); digitalWrite(HIN2, LOW); digitalWrite(HIN3, LOW);
+  digitalWrite(LIN1, LOW); digitalWrite(LIN2, LOW); digitalWrite(LIN3, LOW);
+
+  // Dead time — now truly uninterrupted by scheduler or other core
+  delayMicroseconds(10);
+
+  // Apply new commutation step
+  switch (s) {
+    case 0: digitalWrite(HIN1, HIGH); digitalWrite(LIN2, HIGH); break;
+    case 1: digitalWrite(HIN1, HIGH); digitalWrite(LIN3, HIGH); break;
+    case 2: digitalWrite(HIN2, HIGH); digitalWrite(LIN3, HIGH); break;
+    case 3: digitalWrite(HIN2, HIGH); digitalWrite(LIN1, HIGH); break;
+    case 4: digitalWrite(HIN3, HIGH); digitalWrite(LIN1, HIGH); break;
+    case 5: digitalWrite(HIN3, HIGH); digitalWrite(LIN2, HIGH); break;
+  }
+
+  taskEXIT_CRITICAL(&commMux);
+  // --- End atomic section ---
+}
+
+/* =========================================================
+   ENCODER TASK
+   FIX: encoderDir[] is already applied in the ISRs, so
+        this task simply converts raw counts to degrees
+        without multiplying by encoderDir again.
+   ========================================================= */
+void encoderTask(void *) {
+  while (1) {
+    xSemaphoreTake(encMutex, portMAX_DELAY);
+    for (int i = 0; i < 5; i++) {
+      motorAngle[i] = (float)encoderCnt[i] * encoderCal[i];
+    }
+    xSemaphoreGive(encMutex);
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
